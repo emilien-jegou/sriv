@@ -77,6 +77,15 @@ Just put whatever modifiers (`ctrl`, `shift`, `alt`) if you want and `+` and the
 "ctrl+e" = "exiv2 {file}"
 ```
 
+you can also put general UI settings in `~/.config/sriv/config.toml`.
+
+```toml
+# optional: path to a .ttf or .otf font to use for all UI text
+ui_font_path = "/usr/share/fonts/noto/NotoSansMono-Regular.ttf"
+```
+
+if `ui_font_path` is unset or fails to load, sriv falls back to nannou's bundled default font.
+
 # design
 
 The goal is to have a super fast, responsive image viewer that can handle tens of thousands of 100 megapixel photos and generate thumbnails/CLIP embeddings in parallel.

@@ -3,7 +3,9 @@ use crate::FullImageMessage;
 use crossbeam_channel::{Receiver as CbReceiver, Sender as CbSender};
 use nannou::image::DynamicImage;
 use nannou::prelude::{Key, Rect, Vec2, WindowId};
+use nannou::text::Font;
 use nannou::wgpu;
+use portable_pty::MasterPty;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -11,6 +13,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Instant, SystemTime};
 use toml::Value as TomlValue;
+use vt100::Parser;
 
 #[derive(Debug)]
 pub enum Mode {
@@ -214,6 +217,15 @@ pub fn parse_bindings(s: &str) -> Vec<KeyBinding> {
     bindings
 }
 
+pub fn parse_ui_font_path(s: &str) -> Option<PathBuf> {
+    let value = toml::from_str::<TomlValue>(s).ok()?;
+    let table = value.as_table()?;
+    table
+        .get("ui_font_path")
+        .and_then(TomlValue::as_str)
+        .map(PathBuf::from)
+}
+
 #[derive(Debug)]
 pub struct SearchState {
     pub input: String,
@@ -269,8 +281,47 @@ pub struct ThumbnailUpdate {
 }
 
 #[derive(Debug)]
+pub enum CommandEvent {
+    Output {
+        session_id: u64,
+        bytes: Vec<u8>,
+    },
+    Finished {
+        session_id: u64,
+        exit_code: u32,
+        signal: Option<String>,
+    },
+    Failed {
+        session_id: u64,
+        error: String,
+    },
+}
+
+pub struct TerminalSession {
+    pub id: u64,
+    pub title: String,
+    pub command: String,
+    pub parser: Parser,
+    pub master: Option<Box<dyn MasterPty + Send>>,
+    pub scrollback_offset: usize,
+    pub running: bool,
+    pub exit_code: Option<u32>,
+    pub signal: Option<String>,
+    pub error: Option<String>,
+}
+
+pub struct TerminalState {
+    pub sessions: Vec<TerminalSession>,
+    pub visible: bool,
+    pub active: usize,
+    pub next_id: u64,
+    pub rows: u16,
+    pub cols: u16,
+}
+
 pub struct Model {
     pub image_paths: Vec<PathBuf>,
+    pub ui_font: Font,
     pub thumb_visible: HashMap<usize, ThumbnailTexture>,
     pub thumb_data: HashMap<usize, ThumbnailEntry>,
     pub thumb_has_xmp: Vec<bool>,
@@ -297,9 +348,9 @@ pub struct Model {
     pub selection_changed_at: Instant,
     pub selection_pending: bool,
     pub key_bindings: Vec<KeyBinding>,
-    pub command_tx: Sender<String>,
-    pub command_rx: Receiver<String>,
-    pub command_output: Option<String>,
+    pub command_tx: Sender<CommandEvent>,
+    pub command_rx: Receiver<CommandEvent>,
+    pub terminal: TerminalState,
     pub clip_engine: ClipEngine,
     pub clip_missing: HashSet<usize>,
     pub clip_inflight: HashSet<usize>,

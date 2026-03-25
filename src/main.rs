@@ -5,11 +5,14 @@ use nannou::event::{ModifiersState, MouseButton, MouseScrollDelta, TouchPhase, U
 use nannou::image::imageops::crop_imm;
 use nannou::image::{self, DynamicImage, GenericImageView, RgbaImage};
 use nannou::prelude::*;
+use nannou::text;
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::TryFrom;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::channel;
 use std::sync::Arc;
@@ -22,8 +25,9 @@ mod state;
 use clip::{ClipEngine, ClipEvent};
 use grid::ThumbnailGrid;
 use state::{
-    parse_bindings, FullPendingState, Mode, Model, SearchState, ThumbRequestQueue, ThumbnailEntry,
-    ThumbnailTexture, ThumbnailUpdate, Tile, TiledTexture,
+    parse_bindings, parse_ui_font_path, CommandEvent, FullPendingState, Mode, Model, SearchState,
+    TerminalSession, TerminalState, ThumbRequestQueue, ThumbnailEntry, ThumbnailTexture,
+    ThumbnailUpdate, Tile, TiledTexture,
 };
 
 type FullImageTile = (u32, u32, u32, u32, Vec<u8>);
@@ -50,6 +54,15 @@ const FULL_PENDING_RETRY: Duration = Duration::from_secs(5);
 pub(crate) const THUMB_PREFETCH_ROWS: usize = 1;
 /// Number of files to poll for modifications each update tick.
 const FILE_WATCH_BATCH: usize = 32;
+const TERMINAL_PANEL_FRACTION: f32 = 0.42;
+const TERMINAL_PANEL_MIN_HEIGHT: f32 = 180.0;
+const TERMINAL_TAB_HEIGHT: f32 = 28.0;
+const TERMINAL_STATUS_HEIGHT: f32 = 22.0;
+const TERMINAL_MARGIN: f32 = 12.0;
+const TERMINAL_FONT_SIZE: u32 = 14;
+const TERMINAL_CELL_WIDTH: f32 = 8.4;
+const TERMINAL_CELL_HEIGHT: f32 = 18.0;
+const TERMINAL_SCROLLBACK: usize = 4_000;
 
 /// List of recognized raw file extensions for detecting XMP sidecars.
 const RAW_EXTENSIONS: &[&str] = &[
@@ -57,6 +70,320 @@ const RAW_EXTENSIONS: &[&str] = &[
     "iiq", "k25", "kdc", "mdc", "mef", "mos", "mrw", "nef", "nrw", "orf", "pef", "ptx", "pxn",
     "raf", "raw", "rwl", "rw2", "rwz", "sr2", "srf", "srw", "x3f",
 ];
+
+fn load_ui_font(configured_path: Option<&Path>) -> text::Font {
+    if let Some(path) = configured_path {
+        match text::font::from_file(path) {
+            Ok(font) => return font,
+            Err(err) => {
+                eprintln!("Failed to load ui_font_path {}: {}", path.display(), err);
+            }
+        }
+    }
+    text::font::default_notosans()
+}
+
+fn terminal_panel_height(rect: Rect) -> f32 {
+    (rect.h() * TERMINAL_PANEL_FRACTION)
+        .max(TERMINAL_PANEL_MIN_HEIGHT)
+        .min(rect.h() - 40.0)
+}
+
+fn terminal_panel_rect(rect: Rect) -> Rect {
+    let height = terminal_panel_height(rect);
+    Rect::from_x_y_w_h(0.0, rect.bottom() + height / 2.0, rect.w(), height)
+}
+
+fn terminal_body_rect(panel_rect: Rect) -> Rect {
+    let height = (panel_rect.h() - TERMINAL_TAB_HEIGHT - TERMINAL_STATUS_HEIGHT).max(40.0);
+    let center_y = panel_rect.bottom() + TERMINAL_STATUS_HEIGHT + height / 2.0;
+    Rect::from_x_y_w_h(0.0, center_y, panel_rect.w(), height)
+}
+
+fn terminal_grid_size(rect: Rect) -> (u16, u16) {
+    let panel_rect = terminal_panel_rect(rect);
+    let body_rect = terminal_body_rect(panel_rect);
+    let width = (body_rect.w() - TERMINAL_MARGIN * 2.0).max(TERMINAL_CELL_WIDTH);
+    let height = (body_rect.h() - TERMINAL_MARGIN * 2.0).max(TERMINAL_CELL_HEIGHT);
+    let cols = (width / TERMINAL_CELL_WIDTH).floor().max(1.0) as u16;
+    let rows = (height / TERMINAL_CELL_HEIGHT).floor().max(1.0) as u16;
+    (rows, cols)
+}
+
+fn terminal_pty_size(rows: u16, cols: u16) -> PtySize {
+    PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    }
+}
+
+fn terminal_title(command: &str) -> String {
+    let trimmed = command.trim();
+    let mut title = trimmed
+        .lines()
+        .next()
+        .unwrap_or("command")
+        .trim()
+        .to_string();
+    if title.len() > 28 {
+        title.truncate(28);
+        title.push('…');
+    }
+    if title.is_empty() {
+        "command".to_string()
+    } else {
+        title
+    }
+}
+
+fn active_terminal_session(model: &Model) -> Option<&TerminalSession> {
+    model.terminal.sessions.get(model.terminal.active)
+}
+
+fn active_terminal_session_mut(model: &mut Model) -> Option<&mut TerminalSession> {
+    model.terminal.sessions.get_mut(model.terminal.active)
+}
+
+fn sync_terminal_viewport(app: &App, model: &mut Model) {
+    let Some(rect) = current_window_rect(app, model) else {
+        return;
+    };
+    let (rows, cols) = terminal_grid_size(rect);
+    model.terminal.rows = rows;
+    model.terminal.cols = cols;
+}
+
+fn set_active_terminal(model: &mut Model, active: usize) {
+    if model.terminal.sessions.is_empty() {
+        model.terminal.active = 0;
+        return;
+    }
+    model.terminal.active = active.min(model.terminal.sessions.len() - 1);
+    if let Some(session) = active_terminal_session_mut(model) {
+        session
+            .parser
+            .screen_mut()
+            .set_scrollback(session.scrollback_offset);
+        session.scrollback_offset = session.parser.screen().scrollback();
+    }
+}
+
+fn cycle_terminal_tab(model: &mut Model, delta: isize) {
+    let len = model.terminal.sessions.len();
+    if len == 0 {
+        return;
+    }
+    let len = len as isize;
+    let next = ((model.terminal.active as isize + delta).rem_euclid(len)) as usize;
+    set_active_terminal(model, next);
+}
+
+fn scroll_active_terminal(model: &mut Model, delta: isize) {
+    let Some(session) = active_terminal_session_mut(model) else {
+        return;
+    };
+    if delta < 0 {
+        session.scrollback_offset = session
+            .scrollback_offset
+            .saturating_sub(delta.unsigned_abs());
+    } else {
+        session.scrollback_offset = session.scrollback_offset.saturating_add(delta as usize);
+    }
+    session
+        .parser
+        .screen_mut()
+        .set_scrollback(session.scrollback_offset);
+    session.scrollback_offset = session.parser.screen().scrollback();
+}
+
+fn close_active_terminal(model: &mut Model) {
+    if model.terminal.sessions.is_empty() {
+        return;
+    }
+    let active = model.terminal.active.min(model.terminal.sessions.len() - 1);
+    model.terminal.sessions.remove(active);
+    if model.terminal.sessions.is_empty() {
+        model.terminal.active = 0;
+        model.terminal.visible = false;
+        return;
+    }
+    set_active_terminal(model, active.min(model.terminal.sessions.len() - 1));
+}
+
+fn launch_terminal_command(app: &App, model: &mut Model, command: String) {
+    sync_terminal_viewport(app, model);
+    let rows = model.terminal.rows.max(1);
+    let cols = model.terminal.cols.max(1);
+    let session_id = model.terminal.next_id;
+    model.terminal.next_id += 1;
+    model.terminal.visible = true;
+
+    let mut parser = vt100::Parser::new(rows, cols, TERMINAL_SCROLLBACK);
+    parser.screen_mut().set_scrollback(0);
+
+    let title = terminal_title(&command);
+    let pty_system = native_pty_system();
+    let proxy = app.create_proxy();
+    let tx = model.command_tx.clone();
+
+    let session = match pty_system.openpty(terminal_pty_size(rows, cols)) {
+        Ok(pair) => match pair.master.try_clone_reader() {
+            Ok(mut reader) => {
+                let mut builder = CommandBuilder::new("sh");
+                builder.arg("-c");
+                builder.arg(&command);
+
+                match pair.slave.spawn_command(builder) {
+                    Ok(mut child) => {
+                        let reader_tx = tx.clone();
+                        let reader_proxy = proxy.clone();
+                        thread::spawn(move || {
+                            let mut buf = vec![0_u8; 8192];
+                            loop {
+                                match reader.read(&mut buf) {
+                                    Ok(0) => break,
+                                    Ok(n) => {
+                                        let _ = reader_tx.send(CommandEvent::Output {
+                                            session_id,
+                                            bytes: buf[..n].to_vec(),
+                                        });
+                                        let _ = reader_proxy.wakeup();
+                                    }
+                                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                                    Err(err) => {
+                                        let _ = reader_tx.send(CommandEvent::Failed {
+                                            session_id,
+                                            error: format!("Terminal read failed: {err}"),
+                                        });
+                                        let _ = reader_proxy.wakeup();
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+                        thread::spawn(move || {
+                            let event = match child.wait() {
+                                Ok(status) => CommandEvent::Finished {
+                                    session_id,
+                                    exit_code: status.exit_code(),
+                                    signal: status.signal().map(str::to_string),
+                                },
+                                Err(err) => CommandEvent::Failed {
+                                    session_id,
+                                    error: format!("Failed to wait for command: {err}"),
+                                },
+                            };
+                            let _ = tx.send(event);
+                            let _ = proxy.wakeup();
+                        });
+
+                        TerminalSession {
+                            id: session_id,
+                            title,
+                            command,
+                            parser,
+                            master: Some(pair.master),
+                            scrollback_offset: 0,
+                            running: true,
+                            exit_code: None,
+                            signal: None,
+                            error: None,
+                        }
+                    }
+                    Err(error) => TerminalSession {
+                        id: session_id,
+                        title,
+                        command,
+                        parser,
+                        master: Some(pair.master),
+                        scrollback_offset: 0,
+                        running: false,
+                        exit_code: None,
+                        signal: None,
+                        error: Some(format!("Failed to spawn command: {error}")),
+                    },
+                }
+            }
+            Err(error) => TerminalSession {
+                id: session_id,
+                title,
+                command,
+                parser,
+                master: Some(pair.master),
+                scrollback_offset: 0,
+                running: false,
+                exit_code: None,
+                signal: None,
+                error: Some(format!("Failed to open PTY reader: {error}")),
+            },
+        },
+        Err(error) => {
+            parser.process(format!("Failed to allocate PTY: {error}\r\n").as_bytes());
+            TerminalSession {
+                id: session_id,
+                title,
+                command,
+                parser,
+                master: None,
+                scrollback_offset: 0,
+                running: false,
+                exit_code: None,
+                signal: None,
+                error: Some(format!("Failed to allocate PTY: {error}")),
+            }
+        }
+    };
+
+    model.terminal.sessions.push(session);
+    set_active_terminal(model, model.terminal.sessions.len() - 1);
+}
+
+fn vt_color_to_rgba(color: vt100::Color, bold: bool, default: Rgba) -> Rgba {
+    match color {
+        vt100::Color::Default => default,
+        vt100::Color::Rgb(r, g, b) => {
+            srgba(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0)
+        }
+        vt100::Color::Idx(idx) => ansi_color(idx, bold),
+    }
+}
+
+fn ansi_color(idx: u8, bold: bool) -> Rgba {
+    let idx = if bold && idx < 8 { idx + 8 } else { idx };
+    let [r, g, b] = match idx {
+        0 => [12, 12, 12],
+        1 => [197, 15, 31],
+        2 => [19, 161, 14],
+        3 => [193, 156, 0],
+        4 => [0, 55, 218],
+        5 => [136, 23, 152],
+        6 => [58, 150, 221],
+        7 => [204, 204, 204],
+        8 => [118, 118, 118],
+        9 => [231, 72, 86],
+        10 => [22, 198, 12],
+        11 => [249, 241, 165],
+        12 => [59, 120, 255],
+        13 => [180, 0, 158],
+        14 => [97, 214, 214],
+        15 => [242, 242, 242],
+        16..=231 => {
+            let cube = idx - 16;
+            let r = cube / 36;
+            let g = (cube % 36) / 6;
+            let b = cube % 6;
+            let convert = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
+            [convert(r), convert(g), convert(b)]
+        }
+        232..=255 => {
+            let level = 8 + (idx - 232) * 10;
+            [level, level, level]
+        }
+    };
+    srgba(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0)
+}
 
 /// Mouse click handler: select thumbnail on left-click in thumbnail mode.
 fn mouse_pressed(app: &App, model: &mut Model, button: MouseButton) {
@@ -103,6 +430,16 @@ fn mouse_pressed(app: &App, model: &mut Model, button: MouseButton) {
 
 /// Mouse wheel scroll handler to scroll thumbnails in thumbnail view.
 fn mouse_wheel(app: &App, model: &mut Model, delta: MouseScrollDelta, _phase: TouchPhase) {
+    if model.terminal.visible && !model.terminal.sessions.is_empty() {
+        let scroll_amount = match delta {
+            MouseScrollDelta::LineDelta(_, y) => (-y * 3.0).round() as isize,
+            MouseScrollDelta::PixelDelta(pos) => (-pos.y as f32 / 24.0).round() as isize,
+        };
+        if scroll_amount != 0 {
+            scroll_active_terminal(model, scroll_amount);
+        }
+        return;
+    }
     match model.mode {
         Mode::Thumbnails => {
             // Determine scroll amount: line vs pixel delta
@@ -554,21 +891,28 @@ fn model(app: &App) -> Model {
         .window(window_id)
         .map(|w| w.rect())
         .unwrap_or_else(|| Rect::from_w_h(0.0, 0.0));
-    // Load user key bindings from config file
+    // Load user configuration files.
     let config_home = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
         .unwrap_or_else(|| PathBuf::from("."));
-    let config_path = config_home.join("sriv").join("bindings.toml");
-    let key_bindings = if let Ok(contents) = fs::read_to_string(&config_path) {
+    let config_dir = config_home.join("sriv");
+    let bindings_path = config_dir.join("bindings.toml");
+    let key_bindings = if let Ok(contents) = fs::read_to_string(&bindings_path) {
         parse_bindings(&contents)
     } else {
         Vec::new()
     };
-    // Channel for receiving command output from custom commands
-    let (command_tx, command_rx) = channel::<String>();
+    let app_config_path = config_dir.join("config.toml");
+    let ui_font_path = fs::read_to_string(&app_config_path)
+        .ok()
+        .and_then(|contents| parse_ui_font_path(&contents));
+    let ui_font = load_ui_font(ui_font_path.as_deref());
+    // Channel for receiving command terminal updates from custom commands
+    let (command_tx, command_rx) = channel::<CommandEvent>();
     let mut model = Model {
         image_paths,
+        ui_font,
         thumb_visible: HashMap::new(),
         thumb_data: HashMap::new(),
         thumb_has_xmp,
@@ -596,10 +940,17 @@ fn model(app: &App) -> Model {
         selection_pending: false,
         // Custom key bindings
         key_bindings,
-        // Command output handling
+        // Command terminal handling
         command_tx,
         command_rx,
-        command_output: None,
+        terminal: TerminalState {
+            sessions: Vec::new(),
+            visible: false,
+            active: 0,
+            next_id: 1,
+            rows: 24,
+            cols: 80,
+        },
         clip_engine,
         clip_missing,
         clip_inflight,
@@ -1074,6 +1425,49 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
     if handle_search_key(app, model, key) {
         return;
     }
+
+    if app.keys.mods == ModifiersState::empty() {
+        match key {
+            Key::X => {
+                model.terminal.visible = !model.terminal.visible;
+                return;
+            }
+            Key::Left | Key::H if model.terminal.visible && !model.terminal.sessions.is_empty() => {
+                cycle_terminal_tab(model, -1);
+                return;
+            }
+            Key::Right | Key::L
+                if model.terminal.visible && !model.terminal.sessions.is_empty() =>
+            {
+                cycle_terminal_tab(model, 1);
+                return;
+            }
+            Key::Up | Key::K if model.terminal.visible && !model.terminal.sessions.is_empty() => {
+                scroll_active_terminal(model, 1);
+                return;
+            }
+            Key::Down | Key::J if model.terminal.visible && !model.terminal.sessions.is_empty() => {
+                scroll_active_terminal(model, -1);
+                return;
+            }
+            Key::PageUp if model.terminal.visible && !model.terminal.sessions.is_empty() => {
+                let page = model.terminal.rows.max(1) as isize;
+                scroll_active_terminal(model, page);
+                return;
+            }
+            Key::PageDown if model.terminal.visible && !model.terminal.sessions.is_empty() => {
+                let page = model.terminal.rows.max(1) as isize;
+                scroll_active_terminal(model, -page);
+                return;
+            }
+            Key::Back if model.terminal.visible && !model.terminal.sessions.is_empty() => {
+                close_active_terminal(model);
+                return;
+            }
+            _ => {}
+        }
+    }
+
     let len = model.image_paths.len();
     if app.keys.mods == ModifiersState::empty() {
         match key {
@@ -1200,10 +1594,6 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
                     model.pan = vec2(0.0, 0.0);
                 }
             }
-            // Clear command output display
-            Key::X => {
-                model.command_output = None;
-            }
             _ => {}
         }
     } else if app.keys.mods == ModifiersState::SHIFT && key == Key::G {
@@ -1218,6 +1608,7 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
     let current_file = model.image_paths[model.current]
         .to_string_lossy()
         .to_string();
+    let mut commands_to_launch = Vec::new();
     for binding in &model.key_bindings {
         if key == binding.key
             && app.keys.mods.ctrl() == binding.ctrl
@@ -1225,28 +1616,11 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
             && app.keys.mods.alt() == binding.alt
             && app.keys.mods.logo() == binding.super_key
         {
-            let cmd = binding.command.replace("{file}", &current_file);
-            let tx = model.command_tx.clone();
-            thread::spawn(move || {
-                match std::process::Command::new("sh").arg("-c").arg(cmd).output() {
-                    Ok(output) => {
-                        let stdout = String::from_utf8_lossy(&output.stdout);
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        let mut s = stdout.to_string();
-                        if !stderr.is_empty() {
-                            if !s.is_empty() {
-                                s.push('\n');
-                            }
-                            s.push_str(&stderr);
-                        }
-                        let _ = tx.send(s);
-                    }
-                    Err(e) => {
-                        let _ = tx.send(format!("Failed to execute command: {}", e));
-                    }
-                }
-            });
+            commands_to_launch.push(binding.command.replace("{file}", &current_file));
         }
+    }
+    for cmd in commands_to_launch {
+        launch_terminal_command(app, model, cmd);
     }
 
     // Auto-scroll to keep current thumbnail in view
@@ -1262,6 +1636,8 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
 
 /// Update function to process incoming thumbnail images.
 fn update(app: &App, model: &mut Model, _update: Update) {
+    sync_terminal_viewport(app, model);
+
     while let Ok(update) = model.thumb_rx.try_recv() {
         handle_thumbnail_update(app, model, update);
     }
@@ -1312,9 +1688,57 @@ fn update(app: &App, model: &mut Model, _update: Update) {
             Err(crossbeam_channel::TryRecvError::Disconnected) => break,
         }
     }
-    // Receive command output messages for display
-    while let Ok(msg) = model.command_rx.try_recv() {
-        model.command_output = Some(msg);
+    // Receive command terminal events.
+    while let Ok(event) = model.command_rx.try_recv() {
+        match event {
+            CommandEvent::Output { session_id, bytes } => {
+                if let Some(session) = model
+                    .terminal
+                    .sessions
+                    .iter_mut()
+                    .find(|session| session.id == session_id)
+                {
+                    session.parser.process(&bytes);
+                    session
+                        .parser
+                        .screen_mut()
+                        .set_scrollback(session.scrollback_offset);
+                    session.scrollback_offset = session.parser.screen().scrollback();
+                }
+            }
+            CommandEvent::Finished {
+                session_id,
+                exit_code,
+                signal,
+            } => {
+                if let Some(session) = model
+                    .terminal
+                    .sessions
+                    .iter_mut()
+                    .find(|session| session.id == session_id)
+                {
+                    session.running = false;
+                    session.exit_code = Some(exit_code);
+                    session.signal = signal;
+                    session.master = None;
+                }
+            }
+            CommandEvent::Failed { session_id, error } => {
+                if let Some(session) = model
+                    .terminal
+                    .sessions
+                    .iter_mut()
+                    .find(|session| session.id == session_id)
+                {
+                    if session.error.is_none() {
+                        session.parser.process(format!("{error}\r\n").as_bytes());
+                    }
+                    session.error = Some(error);
+                    session.running = false;
+                    session.master = None;
+                }
+            }
+        }
     }
     detect_file_changes(app, model);
 
@@ -1413,6 +1837,180 @@ fn update(app: &App, model: &mut Model, _update: Update) {
     }
     update_thumbnail_requests(app, model);
 }
+
+fn terminal_status_text(session: &TerminalSession) -> String {
+    if let Some(error) = &session.error {
+        return error.clone();
+    }
+    if session.running {
+        return "running".to_string();
+    }
+    if let Some(signal) = &session.signal {
+        return format!("terminated by {signal}");
+    }
+    match session.exit_code {
+        Some(0) => "completed".to_string(),
+        Some(code) => format!("exit {code}"),
+        None => "finished".to_string(),
+    }
+}
+
+fn terminal_tab_label(session: &TerminalSession) -> String {
+    if let Some(error) = &session.error {
+        return format!("{}  {}", session.title, error);
+    }
+    if session.running {
+        return format!("{}  running", session.title);
+    }
+    if let Some(signal) = &session.signal {
+        return format!("{}  {}", session.title, signal);
+    }
+    if matches!(session.exit_code, Some(0) | None) {
+        return session.title.clone();
+    }
+    format!("{}  exit {}", session.title, session.exit_code.unwrap())
+}
+
+fn draw_terminal_panel(draw: &Draw, model: &Model, rect: Rect) {
+    if !model.terminal.visible {
+        return;
+    }
+
+    let panel_rect = terminal_panel_rect(rect);
+    let body_rect = terminal_body_rect(panel_rect);
+    let tabs_y = panel_rect.top() - TERMINAL_TAB_HEIGHT / 2.0;
+    let status_y = panel_rect.bottom() + TERMINAL_STATUS_HEIGHT / 2.0;
+    let panel_bg = srgba(0.03, 0.04, 0.05, 0.92);
+    let body_bg = srgba(0.05, 0.06, 0.08, 0.98);
+    let default_fg = srgba(0.88, 0.9, 0.92, 1.0);
+    let default_bg = body_bg;
+
+    draw.rect()
+        .x_y(panel_rect.x(), panel_rect.y())
+        .w_h(panel_rect.w(), panel_rect.h())
+        .color(panel_bg);
+    draw.rect()
+        .x_y(body_rect.x(), body_rect.y())
+        .w_h(body_rect.w(), body_rect.h())
+        .color(body_bg);
+
+    if model.terminal.sessions.is_empty() {
+        draw.text("No terminal sessions yet")
+            .font(model.ui_font.clone())
+            .font_size(16)
+            .color(default_fg)
+            .x_y(body_rect.x(), body_rect.y());
+        return;
+    }
+
+    let tab_count = model.terminal.sessions.len().max(1) as f32;
+    let tab_width = panel_rect.w() / tab_count;
+    let tabs_start = panel_rect.left() + tab_width / 2.0;
+    for (idx, session) in model.terminal.sessions.iter().enumerate() {
+        let x = tabs_start + idx as f32 * tab_width;
+        let is_active = idx == model.terminal.active;
+        let tab_bg = if is_active && session.running {
+            srgba(0.15, 0.38, 0.2, 0.95)
+        } else if is_active {
+            srgba(0.2, 0.24, 0.28, 0.95)
+        } else if session.running {
+            srgba(0.1, 0.2, 0.14, 0.85)
+        } else {
+            srgba(0.11, 0.12, 0.15, 0.85)
+        };
+        let label = terminal_tab_label(session);
+        draw.rect()
+            .x_y(x, tabs_y)
+            .w_h((tab_width - 2.0).max(1.0), TERMINAL_TAB_HEIGHT - 4.0)
+            .color(tab_bg);
+        draw.text(&label)
+            .font(model.ui_font.clone())
+            .font_size(13)
+            .color(default_fg)
+            .w_h((tab_width - 14.0).max(1.0), TERMINAL_TAB_HEIGHT - 4.0)
+            .x_y(x, tabs_y - 1.0)
+            .left_justify();
+    }
+
+    let session = active_terminal_session(model).unwrap();
+    let screen = session.parser.screen();
+    let (rows, cols) = screen.size();
+    let visible_rows = rows.min(model.terminal.rows.max(1));
+    let visible_cols = cols.min(model.terminal.cols.max(1));
+    let row_start = rows.saturating_sub(visible_rows);
+    let origin_x = body_rect.left() + TERMINAL_MARGIN + TERMINAL_CELL_WIDTH / 2.0;
+    let origin_y = body_rect.top() - TERMINAL_MARGIN - TERMINAL_CELL_HEIGHT / 2.0;
+
+    for visible_row in 0..visible_rows {
+        let row = row_start + visible_row;
+        for col in 0..visible_cols {
+            let Some(cell) = screen.cell(row, col) else {
+                continue;
+            };
+            if cell.is_wide_continuation() {
+                continue;
+            }
+
+            let mut fg = vt_color_to_rgba(cell.fgcolor(), cell.bold(), default_fg);
+            let mut bg = vt_color_to_rgba(cell.bgcolor(), false, default_bg);
+            if cell.inverse() {
+                std::mem::swap(&mut fg, &mut bg);
+            }
+
+            let x = origin_x + col as f32 * TERMINAL_CELL_WIDTH;
+            let y = origin_y - visible_row as f32 * TERMINAL_CELL_HEIGHT;
+
+            if bg != default_bg {
+                draw.rect()
+                    .x_y(x, y)
+                    .w_h(TERMINAL_CELL_WIDTH, TERMINAL_CELL_HEIGHT)
+                    .color(bg);
+            }
+
+            if cell.has_contents() {
+                draw.text(cell.contents())
+                    .font(model.ui_font.clone())
+                    .font_size(TERMINAL_FONT_SIZE)
+                    .color(fg)
+                    .w_h(TERMINAL_CELL_WIDTH * 2.0, TERMINAL_CELL_HEIGHT)
+                    .x_y(x, y - 1.0)
+                    .left_justify();
+            }
+
+            if cell.underline() {
+                draw.line()
+                    .start(pt2(
+                        x - TERMINAL_CELL_WIDTH / 2.0,
+                        y - TERMINAL_CELL_HEIGHT / 2.6,
+                    ))
+                    .end(pt2(
+                        x + TERMINAL_CELL_WIDTH / 2.0,
+                        y - TERMINAL_CELL_HEIGHT / 2.6,
+                    ))
+                    .weight(1.0)
+                    .color(fg);
+            }
+        }
+    }
+
+    let status = format!(
+        "{} | {} | x toggle | arrows tabs/scroll | backspace close tab",
+        session.command,
+        terminal_status_text(session)
+    );
+    draw.rect()
+        .x_y(0.0, status_y)
+        .w_h(panel_rect.w(), TERMINAL_STATUS_HEIGHT)
+        .color(srgba(0.08, 0.09, 0.11, 0.95));
+    draw.text(&status)
+        .font(model.ui_font.clone())
+        .font_size(12)
+        .color(default_fg)
+        .w_h(panel_rect.w() - 20.0, TERMINAL_STATUS_HEIGHT)
+        .x_y(0.0, status_y - 1.0)
+        .left_justify();
+}
+
 fn touch_full_texture(model: &mut Model, idx: usize) {
     if !model.full_textures.contains_key(&idx) {
         return;
@@ -1700,6 +2298,7 @@ fn view(app: &App, model: &Model, frame: Frame) {
                                     .w_h(icon_w, icon_h)
                                     .color(srgba(1.0, 0.0, 0.0, 0.85));
                                 draw.text("XMP")
+                                    .font(model.ui_font.clone())
                                     .font_size(12)
                                     .w_h(icon_w, icon_h)
                                     .x_y(icon_center_x, icon_center_y - 1.0)
@@ -1742,6 +2341,7 @@ fn view(app: &App, model: &Model, frame: Frame) {
                 .color(srgba(0.0, 0.0, 0.0, 0.5));
             let full_path = model.image_paths[model.current].to_string_lossy();
             draw.text(&full_path)
+                .font(model.ui_font.clone())
                 .font_size(14)
                 .w_h(rect.w(), bar_h)
                 .x_y(0.0, bar_y)
@@ -1750,6 +2350,7 @@ fn view(app: &App, model: &Model, frame: Frame) {
             // Index of selected image
             let count = format!("{}/{}", model.current + 1, model.image_paths.len());
             draw.text(&count)
+                .font(model.ui_font.clone())
                 .font_size(14)
                 .w_h(rect.w(), bar_h)
                 .x_y(0.0, bar_y)
@@ -1831,6 +2432,7 @@ fn view(app: &App, model: &Model, frame: Frame) {
                 // Full path, left-aligned
                 let full_path = model.image_paths[model.current].to_string_lossy();
                 draw.text(&full_path)
+                    .font(model.ui_font.clone())
                     .font_size(14)
                     .color(WHITE)
                     .w_h(rect.w(), bar_h)
@@ -1839,6 +2441,7 @@ fn view(app: &App, model: &Model, frame: Frame) {
                 // Dimensions and zoom, right-aligned
                 let info = format!("{}×{}  {:.2}×", full_w, full_h, model.zoom);
                 draw.text(&info)
+                    .font(model.ui_font.clone())
                     .font_size(14)
                     .color(WHITE)
                     .w_h(rect.w(), bar_h)
@@ -1846,6 +2449,7 @@ fn view(app: &App, model: &Model, frame: Frame) {
                     .right_justify();
             } else {
                 draw.text("Loading...")
+                    .font(model.ui_font.clone())
                     .font_size(24)
                     .color(WHITE)
                     .x_y(0.0, 0.0);
@@ -1860,6 +2464,7 @@ fn view(app: &App, model: &Model, frame: Frame) {
                 // Full path, left-aligned
                 let full_path = model.image_paths[model.current].to_string_lossy();
                 draw.text(&full_path)
+                    .font(model.ui_font.clone())
                     .font_size(14)
                     .color(WHITE)
                     .w_h(rect.w(), bar_h)
@@ -1905,12 +2510,14 @@ fn view(app: &App, model: &Model, frame: Frame) {
         };
         draw.rect().x_y(0.0, bar_y).w_h(rect.w(), bar_h).color(bg);
         draw.text(&prompt)
+            .font(model.ui_font.clone())
             .font_size(16)
             .color(WHITE)
             .w_h(rect.w(), bar_h)
             .x_y(0.0, bar_y)
             .left_justify();
         draw.text(&status)
+            .font(model.ui_font.clone())
             .font_size(14)
             .color(WHITE)
             .w_h(rect.w(), bar_h)
@@ -1918,33 +2525,6 @@ fn view(app: &App, model: &Model, frame: Frame) {
             .right_justify();
     }
 
-    // Draw command output overlay if present
-    if let Some(ref out) = model.command_output {
-        let box_height = rect.h() / 2.0;
-        let box_center_y = rect.h() / 4.0;
-        // Semi-transparent background
-        draw.rect()
-            .x_y(0.0, box_center_y)
-            .w_h(rect.w(), box_height)
-            .color(srgba(0.0, 0.0, 0.0, 0.8));
-        let lines: Vec<&str> = out.lines().collect();
-        let font_size = 16;
-        let margin = 10.0;
-        let line_spacing = 2.0;
-        let mut y = rect.h() / 2.0 - margin - (font_size as f32) / 2.0;
-        let text_width = rect.w() - 2.0 * margin;
-        for line in lines {
-            if y < 0.0 {
-                break;
-            }
-            draw.text(line)
-                .font_size(font_size)
-                .w_h(text_width, font_size as f32)
-                .x_y(0.0, y)
-                .left_justify()
-                .color(WHITE);
-            y -= font_size as f32 + line_spacing;
-        }
-    }
+    draw_terminal_panel(&draw, model, rect);
     draw.to_frame(app, &frame).unwrap();
 }
