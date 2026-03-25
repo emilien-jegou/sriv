@@ -63,6 +63,7 @@ const TERMINAL_FONT_SIZE: u32 = 14;
 const TERMINAL_CELL_WIDTH: f32 = 8.4;
 const TERMINAL_CELL_HEIGHT: f32 = 18.0;
 const TERMINAL_SCROLLBACK: usize = 4_000;
+const TERMINAL_NOMINAL_ROWS: u16 = 240;
 
 /// List of recognized raw file extensions for detecting XMP sidecars.
 const RAW_EXTENSIONS: &[&str] = &[
@@ -214,7 +215,7 @@ fn close_active_terminal(model: &mut Model) {
 
 fn launch_terminal_command(app: &App, model: &mut Model, command: String) {
     sync_terminal_viewport(app, model);
-    let rows = model.terminal.rows.max(1);
+    let rows = TERMINAL_NOMINAL_ROWS.max(model.terminal.rows.max(1));
     let cols = model.terminal.cols.max(1);
     let session_id = model.terminal.next_id;
     model.terminal.next_id += 1;
@@ -1871,6 +1872,40 @@ fn terminal_tab_label(session: &TerminalSession) -> String {
     format!("{}  exit {}", session.title, session.exit_code.unwrap())
 }
 
+fn terminal_row_start(screen: &vt100::Screen, visible_rows: u16, cols: u16) -> u16 {
+    let (rows, _) = screen.size();
+    let (cursor_row, _) = screen.cursor_position();
+    let mut last_content_row = 0_u16;
+    for row in 0..rows {
+        let mut has_content = false;
+        for col in 0..cols {
+            if screen
+                .cell(row, col)
+                .is_some_and(|cell| cell.has_contents())
+            {
+                has_content = true;
+                break;
+            }
+        }
+        if has_content {
+            last_content_row = row;
+        }
+    }
+    let anchor_row = last_content_row.max(cursor_row);
+    let max_start = rows.saturating_sub(visible_rows);
+    anchor_row
+        .saturating_add(1)
+        .saturating_sub(visible_rows)
+        .min(max_start)
+}
+
+fn terminal_view_row_start(session: &TerminalSession, visible_rows: u16, visible_cols: u16) -> u16 {
+    if session.scrollback_offset > 0 {
+        return 0;
+    }
+    terminal_row_start(session.parser.screen(), visible_rows, visible_cols)
+}
+
 fn draw_terminal_panel(draw: &Draw, model: &Model, rect: Rect) {
     if !model.terminal.visible {
         return;
@@ -1880,8 +1915,8 @@ fn draw_terminal_panel(draw: &Draw, model: &Model, rect: Rect) {
     let body_rect = terminal_body_rect(panel_rect);
     let tabs_y = panel_rect.top() - TERMINAL_TAB_HEIGHT / 2.0;
     let status_y = panel_rect.bottom() + TERMINAL_STATUS_HEIGHT / 2.0;
-    let panel_bg = srgba(0.03, 0.04, 0.05, 0.92);
-    let body_bg = srgba(0.05, 0.06, 0.08, 0.98);
+    let panel_bg = srgba(0.03, 0.04, 0.05, 0.72);
+    let body_bg = srgba(0.05, 0.06, 0.08, 0.82);
     let default_fg = srgba(0.88, 0.9, 0.92, 1.0);
     let default_bg = body_bg;
 
@@ -1910,13 +1945,13 @@ fn draw_terminal_panel(draw: &Draw, model: &Model, rect: Rect) {
         let x = tabs_start + idx as f32 * tab_width;
         let is_active = idx == model.terminal.active;
         let tab_bg = if is_active && session.running {
-            srgba(0.15, 0.38, 0.2, 0.95)
+            srgba(0.15, 0.38, 0.2, 0.82)
         } else if is_active {
-            srgba(0.2, 0.24, 0.28, 0.95)
+            srgba(0.2, 0.24, 0.28, 0.82)
         } else if session.running {
-            srgba(0.1, 0.2, 0.14, 0.85)
+            srgba(0.1, 0.2, 0.14, 0.7)
         } else {
-            srgba(0.11, 0.12, 0.15, 0.85)
+            srgba(0.11, 0.12, 0.15, 0.7)
         };
         let label = terminal_tab_label(session);
         draw.rect()
@@ -1937,7 +1972,7 @@ fn draw_terminal_panel(draw: &Draw, model: &Model, rect: Rect) {
     let (rows, cols) = screen.size();
     let visible_rows = rows.min(model.terminal.rows.max(1));
     let visible_cols = cols.min(model.terminal.cols.max(1));
-    let row_start = rows.saturating_sub(visible_rows);
+    let row_start = terminal_view_row_start(session, visible_rows, visible_cols);
     let origin_x = body_rect.left() + TERMINAL_MARGIN + TERMINAL_CELL_WIDTH / 2.0;
     let origin_y = body_rect.top() - TERMINAL_MARGIN - TERMINAL_CELL_HEIGHT / 2.0;
 
@@ -2001,7 +2036,7 @@ fn draw_terminal_panel(draw: &Draw, model: &Model, rect: Rect) {
     draw.rect()
         .x_y(0.0, status_y)
         .w_h(panel_rect.w(), TERMINAL_STATUS_HEIGHT)
-        .color(srgba(0.08, 0.09, 0.11, 0.95));
+        .color(srgba(0.08, 0.09, 0.11, 0.78));
     draw.text(&status)
         .font(model.ui_font.clone())
         .font_size(12)
