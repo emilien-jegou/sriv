@@ -14,6 +14,7 @@ use std::convert::TryFrom;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::mpsc::channel;
 use std::sync::Arc;
 use std::thread;
@@ -339,6 +340,21 @@ fn launch_terminal_command(app: &App, model: &mut Model, command: String) {
 
     model.terminal.sessions.push(session);
     set_active_terminal(model, model.terminal.sessions.len() - 1);
+}
+
+fn launch_detached_command(command: String) {
+    thread::spawn(move || {
+        let result = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        if let Err(err) = result {
+            eprintln!("Failed to launch detached command: {err}");
+        }
+    });
 }
 
 fn vt_color_to_rgba(color: vt100::Color, bold: bool, default: Rgba) -> Rgba {
@@ -1617,11 +1633,18 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
             && app.keys.mods.alt() == binding.alt
             && app.keys.mods.logo() == binding.super_key
         {
-            commands_to_launch.push(binding.command.replace("{file}", &current_file));
+            commands_to_launch.push((
+                binding.command.replace("{file}", &current_file),
+                binding.use_terminal,
+            ));
         }
     }
-    for cmd in commands_to_launch {
-        launch_terminal_command(app, model, cmd);
+    for (cmd, use_terminal) in commands_to_launch {
+        if use_terminal {
+            launch_terminal_command(app, model, cmd);
+        } else {
+            launch_detached_command(cmd);
+        }
     }
 
     // Auto-scroll to keep current thumbnail in view

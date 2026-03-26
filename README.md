@@ -77,6 +77,14 @@ Just put whatever modifiers (`ctrl`, `shift`, `alt`) if you want and `+` and the
 "ctrl+e" = "exiv2 {file}"
 ```
 
+if you want a binding to launch a graphical app and not attach it to sriv's terminal panel, use the table form and set `terminal = false`.
+
+```toml
+["ctrl+d"]
+command = "~/proj/pupphoto/open_darktable.sh {file}"
+terminal = false
+```
+
 you can also put general UI settings in `~/.config/sriv/config.toml`.
 
 ```toml

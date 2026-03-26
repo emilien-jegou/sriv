@@ -29,6 +29,7 @@ pub struct KeyBinding {
     pub alt: bool,
     pub super_key: bool,
     pub command: String,
+    pub use_terminal: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -125,7 +126,7 @@ impl ThumbRequestQueue {
     }
 }
 
-fn parse_binding_spec(spec: &str, command: &str) -> Option<KeyBinding> {
+fn parse_binding_spec(spec: &str, command: &str, use_terminal: bool) -> Option<KeyBinding> {
     let mut ctrl = false;
     let mut shift = false;
     let mut alt = false;
@@ -200,6 +201,7 @@ fn parse_binding_spec(spec: &str, command: &str) -> Option<KeyBinding> {
         alt,
         super_key,
         command: command.to_string(),
+        use_terminal,
     })
 }
 
@@ -207,10 +209,25 @@ pub fn parse_bindings(s: &str) -> Vec<KeyBinding> {
     let mut bindings = Vec::new();
     if let Ok(TomlValue::Table(table)) = toml::from_str::<TomlValue>(s) {
         for (spec, val) in table {
-            if let TomlValue::String(cmd) = val {
-                if let Some(binding) = parse_binding_spec(&spec, &cmd) {
-                    bindings.push(binding);
+            match val {
+                TomlValue::String(cmd) => {
+                    if let Some(binding) = parse_binding_spec(&spec, &cmd, true) {
+                        bindings.push(binding);
+                    }
                 }
+                TomlValue::Table(binding_table) => {
+                    let command = binding_table.get("command").and_then(TomlValue::as_str);
+                    let use_terminal = binding_table
+                        .get("terminal")
+                        .and_then(TomlValue::as_bool)
+                        .unwrap_or(true);
+                    if let Some(command) = command {
+                        if let Some(binding) = parse_binding_spec(&spec, command, use_terminal) {
+                            bindings.push(binding);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
