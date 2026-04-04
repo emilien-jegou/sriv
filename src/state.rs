@@ -261,12 +261,19 @@ pub enum FullPendingState {
     Failed { last_error_at: Instant },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TilePixelFormat {
+    Rgba8,
+    Rgba16,
+}
+
 #[derive(Debug)]
 pub struct Tile {
     pub x_offset: u32,
     pub y_offset: u32,
     pub width: u32,
     pub height: u32,
+    pub format: TilePixelFormat,
     pub pixel_data: Vec<u8>,
     pub texture: RefCell<Option<wgpu::Texture>>,
 }

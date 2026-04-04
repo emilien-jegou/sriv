@@ -1,9 +1,9 @@
+use ::image as image_rs;
+use ::image::imageops::FilterType as ImageRsFilterType;
 use anyhow::Result;
 use crossbeam_channel::unbounded;
-use image::imageops::FilterType;
 use nannou::event::{ModifiersState, MouseButton, MouseScrollDelta, TouchPhase, Update};
-use nannou::image::imageops::crop_imm;
-use nannou::image::{self, DynamicImage, GenericImageView, RgbaImage};
+use nannou::image::{self, DynamicImage, RgbaImage};
 use nannou::prelude::*;
 use nannou::text;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
@@ -28,10 +28,10 @@ use grid::ThumbnailGrid;
 use state::{
     parse_bindings, parse_ui_font_path, CommandEvent, FullPendingState, Mode, Model, SearchState,
     TerminalSession, TerminalState, ThumbRequestQueue, ThumbnailEntry, ThumbnailTexture,
-    ThumbnailUpdate, Tile, TiledTexture,
+    ThumbnailUpdate, Tile, TilePixelFormat, TiledTexture,
 };
 
-type FullImageTile = (u32, u32, u32, u32, Vec<u8>);
+type FullImageTile = (u32, u32, u32, u32, TilePixelFormat, Vec<u8>);
 
 #[derive(Debug)]
 enum FullImageMessage {
@@ -530,8 +530,7 @@ fn parse_exif_quiet(path: &Path) -> Option<rexif::ExifData> {
     rexif::parse_buffer_quiet(&data).0.ok()
 }
 
-/// Adjust image orientation based on EXIF orientation tag.
-pub(crate) fn adjust_orientation(img: DynamicImage, path: &Path) -> DynamicImage {
+fn adjust_orientation_full(img: image_rs::DynamicImage, path: &Path) -> image_rs::DynamicImage {
     let mut oriented = img;
     if let Some(exif) = parse_exif_quiet(path) {
         for entry in exif.entries {
@@ -555,9 +554,149 @@ pub(crate) fn adjust_orientation(img: DynamicImage, path: &Path) -> DynamicImage
     oriented
 }
 
+fn push_u16_rgba(pixel_data: &mut Vec<u8>, rgba: [u16; 4]) {
+    for channel in rgba {
+        pixel_data.extend_from_slice(&channel.to_ne_bytes());
+    }
+}
+
+fn decode_image_no_limits(path: &Path) -> Result<image_rs::DynamicImage> {
+    let mut reader = image_rs::io::Reader::open(path)?;
+    reader.limits(image_rs::io::Limits::no_limits());
+    Ok(adjust_orientation_full(reader.decode()?, path))
+}
+
+fn collect_tiled_pixels<F>(
+    full_w: u32,
+    full_h: u32,
+    format: TilePixelFormat,
+    bytes_per_pixel: usize,
+    mut fill_pixel: F,
+) -> Vec<FullImageTile>
+where
+    F: FnMut(u32, u32, &mut Vec<u8>),
+{
+    const MAX_TILE_SIZE: u32 = 8192;
+    let mut tiles = Vec::new();
+    for y in (0..full_h).step_by(MAX_TILE_SIZE as usize) {
+        for x in (0..full_w).step_by(MAX_TILE_SIZE as usize) {
+            let tile_w = (full_w - x).min(MAX_TILE_SIZE);
+            let tile_h = (full_h - y).min(MAX_TILE_SIZE);
+            let mut pixel_data =
+                Vec::with_capacity(tile_w as usize * tile_h as usize * bytes_per_pixel);
+            for py in y..(y + tile_h) {
+                for px in x..(x + tile_w) {
+                    fill_pixel(px, py, &mut pixel_data);
+                }
+            }
+            tiles.push((x, y, tile_w, tile_h, format, pixel_data));
+        }
+    }
+    tiles
+}
+
+fn load_full_image_tiles(path: &Path) -> Result<(u32, u32, Vec<FullImageTile>)> {
+    let img = decode_image_no_limits(path)?;
+    let (full_w, full_h) = (img.width(), img.height());
+    let tiles = match img {
+        image_rs::DynamicImage::ImageLuma8(buf) => collect_tiled_pixels(
+            full_w,
+            full_h,
+            TilePixelFormat::Rgba8,
+            4,
+            |px, py, pixel_data| {
+                let [l] = buf.get_pixel(px, py).0;
+                pixel_data.extend_from_slice(&[l, l, l, u8::MAX]);
+            },
+        ),
+        image_rs::DynamicImage::ImageLumaA8(buf) => collect_tiled_pixels(
+            full_w,
+            full_h,
+            TilePixelFormat::Rgba8,
+            4,
+            |px, py, pixel_data| {
+                let [l, a] = buf.get_pixel(px, py).0;
+                pixel_data.extend_from_slice(&[l, l, l, a]);
+            },
+        ),
+        image_rs::DynamicImage::ImageRgb8(buf) => collect_tiled_pixels(
+            full_w,
+            full_h,
+            TilePixelFormat::Rgba8,
+            4,
+            |px, py, pixel_data| {
+                let [r, g, b] = buf.get_pixel(px, py).0;
+                pixel_data.extend_from_slice(&[r, g, b, u8::MAX]);
+            },
+        ),
+        image_rs::DynamicImage::ImageRgba8(buf) => collect_tiled_pixels(
+            full_w,
+            full_h,
+            TilePixelFormat::Rgba8,
+            4,
+            |px, py, pixel_data| {
+                pixel_data.extend_from_slice(&buf.get_pixel(px, py).0);
+            },
+        ),
+        image_rs::DynamicImage::ImageLuma16(buf) => collect_tiled_pixels(
+            full_w,
+            full_h,
+            TilePixelFormat::Rgba16,
+            8,
+            |px, py, pixel_data| {
+                let [l] = buf.get_pixel(px, py).0;
+                push_u16_rgba(pixel_data, [l, l, l, u16::MAX]);
+            },
+        ),
+        image_rs::DynamicImage::ImageLumaA16(buf) => collect_tiled_pixels(
+            full_w,
+            full_h,
+            TilePixelFormat::Rgba16,
+            8,
+            |px, py, pixel_data| {
+                let [l, a] = buf.get_pixel(px, py).0;
+                push_u16_rgba(pixel_data, [l, l, l, a]);
+            },
+        ),
+        image_rs::DynamicImage::ImageRgb16(buf) => collect_tiled_pixels(
+            full_w,
+            full_h,
+            TilePixelFormat::Rgba16,
+            8,
+            |px, py, pixel_data| {
+                let [r, g, b] = buf.get_pixel(px, py).0;
+                push_u16_rgba(pixel_data, [r, g, b, u16::MAX]);
+            },
+        ),
+        image_rs::DynamicImage::ImageRgba16(buf) => collect_tiled_pixels(
+            full_w,
+            full_h,
+            TilePixelFormat::Rgba16,
+            8,
+            |px, py, pixel_data| {
+                push_u16_rgba(pixel_data, buf.get_pixel(px, py).0);
+            },
+        ),
+        other => {
+            let rgba = other.to_rgba8();
+            collect_tiled_pixels(
+                full_w,
+                full_h,
+                TilePixelFormat::Rgba8,
+                4,
+                |px, py, pixel_data| {
+                    pixel_data.extend_from_slice(&rgba.get_pixel(px, py).0);
+                },
+            )
+        }
+    };
+    Ok((full_w, full_h, tiles))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image_rs::{ImageBuffer, Rgb};
 
     #[test]
     fn orientation_from_urational_rounds_down() {
@@ -584,6 +723,38 @@ mod tests {
             denominator: 2,
         }]);
         assert_eq!(orientation_from_tag_value(&value), None);
+    }
+
+    #[test]
+    fn tiles_rgb16_images_as_rgba16_without_whole_image_rgba_conversion() {
+        let img = image_rs::DynamicImage::ImageRgb16(ImageBuffer::from_fn(3, 2, |x, y| {
+            Rgb([
+                (x as u16) * 1000 + 1,
+                (y as u16) * 1000 + 2,
+                (x as u16 + y as u16) * 1000 + 3,
+            ])
+        }));
+        let (full_w, full_h) = (img.width(), img.height());
+        let tiles = match img {
+            image_rs::DynamicImage::ImageRgb16(buf) => collect_tiled_pixels(
+                full_w,
+                full_h,
+                TilePixelFormat::Rgba16,
+                8,
+                |px, py, pixel_data| {
+                    let [r, g, b] = buf.get_pixel(px, py).0;
+                    push_u16_rgba(pixel_data, [r, g, b, u16::MAX]);
+                },
+            ),
+            _ => unreachable!(),
+        };
+
+        assert_eq!(tiles.len(), 1);
+        let (_, _, width, height, format, pixel_data) = &tiles[0];
+        assert_eq!((*width, *height), (3, 2));
+        assert!(matches!(format, TilePixelFormat::Rgba16));
+        assert_eq!(pixel_data.len(), 3 * 2 * 8);
+        assert_eq!(&pixel_data[0..8], &[1, 0, 2, 0, 3, 0, 255, 255]);
     }
 }
 
@@ -768,22 +939,23 @@ fn model(app: &App) -> Model {
                         }
                     }
                     if result.is_none() {
-                        if let Ok(img_orig) = image::open(p) {
-                            let img = adjust_orientation(img_orig, p);
+                        if let Ok(img) = decode_image_no_limits(p) {
                             let mut thumb = img.thumbnail(thumb_size, thumb_size);
-                            let (w0, h0) = thumb.dimensions();
+                            let (w0, h0) = (thumb.width(), thumb.height());
                             if w0 != 0 && h0 != 0 {
                                 let w = w0.max(2);
                                 let h = h0.max(2);
                                 if w != w0 || h != h0 {
-                                    thumb = thumb.resize_exact(w, h, FilterType::Nearest);
+                                    thumb = thumb.resize_exact(w, h, ImageRsFilterType::Nearest);
                                 }
                                 if let Some(parent) = cache_path.parent() {
                                     let _ = fs::create_dir_all(parent);
                                 }
-                                let dyn_thumb = DynamicImage::ImageRgba8(thumb.to_rgba8());
-                                let _ = dyn_thumb.save(&cache_path);
-                                result = Some(dyn_thumb);
+                                if thumb.save(&cache_path).is_ok() {
+                                    if let Ok(img) = image::open(&cache_path) {
+                                        result = Some(DynamicImage::ImageRgba8(img.to_rgba8()));
+                                    }
+                                }
                             }
                         }
                     }
@@ -858,24 +1030,8 @@ fn model(app: &App) -> Model {
             thread::spawn(move || {
                 while let Ok(idx) = req_rx.recv() {
                     if let Some(path) = paths.get(idx) {
-                        match image::open(path) {
-                            Ok(img_orig) => {
-                                let img = adjust_orientation(img_orig, path);
-                                let rgba = img.to_rgba8();
-                                let full_w = rgba.width();
-                                let full_h = rgba.height();
-                                const MAX_TILE_SIZE: u32 = 8192;
-                                let mut tiles_data = Vec::new();
-                                for y in (0..full_h).step_by(MAX_TILE_SIZE as usize) {
-                                    for x in (0..full_w).step_by(MAX_TILE_SIZE as usize) {
-                                        let tile_w = (full_w - x).min(MAX_TILE_SIZE);
-                                        let tile_h = (full_h - y).min(MAX_TILE_SIZE);
-                                        let sub_image: RgbaImage =
-                                            crop_imm(&rgba, x, y, tile_w, tile_h).to_image();
-                                        let raw_pixels = sub_image.into_raw();
-                                        tiles_data.push((x, y, tile_w, tile_h, raw_pixels));
-                                    }
-                                }
+                        match load_full_image_tiles(path) {
+                            Ok((full_w, full_h, tiles_data)) => {
                                 let _ = resp_tx.send(FullImageMessage::Loaded {
                                     index: idx,
                                     full_w,
@@ -1778,12 +1934,13 @@ fn update(app: &App, model: &mut Model, _update: Update) {
                 // Store raw pixel data for lazy texture creation
                 let mut prepared_tiles = Vec::new();
 
-                for (x_offset, y_offset, width, height, pixel_data) in tiles {
+                for (x_offset, y_offset, width, height, format, pixel_data) in tiles {
                     prepared_tiles.push(Tile {
                         x_offset,
                         y_offset,
                         width,
                         height,
+                        format,
                         pixel_data,
                         texture: RefCell::new(None),
                     });
@@ -2443,7 +2600,10 @@ fn view(app: &App, model: &Model, frame: Frame) {
                             mip_level_count: 1,
                             sample_count: 1,
                             dimension: wgpu::TextureDimension::D2,
-                            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                            format: match tile.format {
+                                TilePixelFormat::Rgba8 => wgpu::TextureFormat::Rgba8UnormSrgb,
+                                TilePixelFormat::Rgba16 => wgpu::TextureFormat::Rgba16Unorm,
+                            },
                             usage: wgpu::TextureUsages::TEXTURE_BINDING
                                 | wgpu::TextureUsages::COPY_DST,
                             view_formats: &[],
@@ -2459,7 +2619,10 @@ fn view(app: &App, model: &Model, frame: Frame) {
                             &tile.pixel_data,
                             wgpu::ImageDataLayout {
                                 offset: 0,
-                                bytes_per_row: Some(4 * tile.width),
+                                bytes_per_row: Some(match tile.format {
+                                    TilePixelFormat::Rgba8 => 4 * tile.width,
+                                    TilePixelFormat::Rgba16 => 8 * tile.width,
+                                }),
                                 rows_per_image: Some(tile.height),
                             },
                             size,
