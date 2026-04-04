@@ -560,6 +560,15 @@ fn push_u16_rgba(pixel_data: &mut Vec<u8>, rgba: [u16; 4]) {
     }
 }
 
+fn rgba16_bytes_to_rgba8(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for chunk in bytes.chunks_exact(2) {
+        let value = u16::from_ne_bytes([chunk[0], chunk[1]]);
+        out.push(((value as u32 + 128) / 257) as u8);
+    }
+    out
+}
+
 fn decode_image_no_limits(path: &Path) -> Result<image_rs::DynamicImage> {
     let mut reader = image_rs::io::Reader::open(path)?;
     reader.limits(image_rs::io::Limits::no_limits());
@@ -755,6 +764,18 @@ mod tests {
         assert!(matches!(format, TilePixelFormat::Rgba16));
         assert_eq!(pixel_data.len(), 3 * 2 * 8);
         assert_eq!(&pixel_data[0..8], &[1, 0, 2, 0, 3, 0, 255, 255]);
+    }
+
+    #[test]
+    fn rgba16_fallback_to_rgba8_uses_full_u16_range() {
+        let bytes = [
+            0_u16.to_ne_bytes(),
+            257_u16.to_ne_bytes(),
+            32_768_u16.to_ne_bytes(),
+            u16::MAX.to_ne_bytes(),
+        ]
+        .concat();
+        assert_eq!(rgba16_bytes_to_rgba8(&bytes), vec![0, 1, 128, 255]);
     }
 }
 
@@ -2594,16 +2615,38 @@ fn view(app: &App, model: &Model, frame: Frame) {
                             height: tile.height,
                             depth_or_array_layers: 1,
                         };
+                        let supports_rgba16 = window
+                            .device()
+                            .features()
+                            .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM);
+                        let (texture_format, bytes_per_row, pixel_bytes): (
+                            wgpu::TextureFormat,
+                            u32,
+                            std::borrow::Cow<'_, [u8]>,
+                        ) = match tile.format {
+                            TilePixelFormat::Rgba8 => (
+                                wgpu::TextureFormat::Rgba8UnormSrgb,
+                                4 * tile.width,
+                                std::borrow::Cow::Borrowed(&tile.pixel_data),
+                            ),
+                            TilePixelFormat::Rgba16 if supports_rgba16 => (
+                                wgpu::TextureFormat::Rgba16Unorm,
+                                8 * tile.width,
+                                std::borrow::Cow::Borrowed(&tile.pixel_data),
+                            ),
+                            TilePixelFormat::Rgba16 => (
+                                wgpu::TextureFormat::Rgba8UnormSrgb,
+                                4 * tile.width,
+                                std::borrow::Cow::Owned(rgba16_bytes_to_rgba8(&tile.pixel_data)),
+                            ),
+                        };
                         let descriptor = wgpu::TextureDescriptor {
                             label: None,
                             size,
                             mip_level_count: 1,
                             sample_count: 1,
                             dimension: wgpu::TextureDimension::D2,
-                            format: match tile.format {
-                                TilePixelFormat::Rgba8 => wgpu::TextureFormat::Rgba8UnormSrgb,
-                                TilePixelFormat::Rgba16 => wgpu::TextureFormat::Rgba16Unorm,
-                            },
+                            format: texture_format,
                             usage: wgpu::TextureUsages::TEXTURE_BINDING
                                 | wgpu::TextureUsages::COPY_DST,
                             view_formats: &[],
@@ -2616,13 +2659,10 @@ fn view(app: &App, model: &Model, frame: Frame) {
                                 origin: wgpu::Origin3d::ZERO,
                                 aspect: wgpu::TextureAspect::All,
                             },
-                            &tile.pixel_data,
+                            pixel_bytes.as_ref(),
                             wgpu::ImageDataLayout {
                                 offset: 0,
-                                bytes_per_row: Some(match tile.format {
-                                    TilePixelFormat::Rgba8 => 4 * tile.width,
-                                    TilePixelFormat::Rgba16 => 8 * tile.width,
-                                }),
+                                bytes_per_row: Some(bytes_per_row),
                                 rows_per_image: Some(tile.height),
                             },
                             size,
