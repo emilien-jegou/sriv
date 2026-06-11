@@ -1,7 +1,8 @@
 use ::image as image_rs;
 use ::image::imageops::FilterType as ImageRsFilterType;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use crossbeam_channel::unbounded;
+use libheif_rs::{ColorSpace as HeifColorSpace, HeifContext, LibHeif, Plane, RgbChroma};
 use nannou::event::{ModifiersState, MouseButton, MouseScrollDelta, TouchPhase, Update};
 use nannou::image::{self, DynamicImage, RgbaImage};
 use nannou::prelude::*;
@@ -16,7 +17,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::mpsc::channel;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 mod clip;
@@ -66,12 +67,32 @@ const TERMINAL_CELL_HEIGHT: f32 = 18.0;
 const TERMINAL_SCROLLBACK: usize = 4_000;
 const TERMINAL_NOMINAL_ROWS: u16 = 240;
 
+const IMAGE_EXTENSIONS: &[&str] = &[
+    "jpg", "jpeg", "png", "bmp", "tiff", "gif", "webp", "tif", "heif", "heic",
+];
+
 /// List of recognized raw file extensions for detecting XMP sidecars.
 const RAW_EXTENSIONS: &[&str] = &[
     "3fr", "ari", "arw", "bay", "cap", "cr2", "cr3", "crw", "cs1", "dcr", "dng", "erf", "fff",
     "iiq", "k25", "kdc", "mdc", "mef", "mos", "mrw", "nef", "nrw", "orf", "pef", "ptx", "pxn",
     "raf", "raw", "rwl", "rw2", "rwz", "sr2", "srf", "srw", "x3f",
 ];
+
+fn extension_lower(path: &Path) -> Option<String> {
+    path.extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase())
+}
+
+fn is_heif_path(path: &Path) -> bool {
+    matches!(extension_lower(path).as_deref(), Some("heif" | "heic"))
+}
+
+fn is_supported_image_path(path: &Path) -> bool {
+    extension_lower(path)
+        .as_deref()
+        .is_some_and(|ext| IMAGE_EXTENSIONS.contains(&ext))
+}
 
 fn load_ui_font(configured_path: Option<&Path>) -> text::Font {
     if let Some(path) = configured_path {
@@ -569,7 +590,122 @@ fn rgba16_bytes_to_rgba8(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+fn libheif() -> &'static LibHeif {
+    static LIBHEIF: OnceLock<LibHeif> = OnceLock::new();
+    LIBHEIF.get_or_init(LibHeif::new)
+}
+
+fn heif_target_color_space(has_alpha: bool, high_bit_depth: bool) -> HeifColorSpace {
+    match (has_alpha, high_bit_depth, cfg!(target_endian = "little")) {
+        (false, false, _) => HeifColorSpace::Rgb(RgbChroma::Rgb),
+        (true, false, _) => HeifColorSpace::Rgb(RgbChroma::Rgba),
+        (false, true, true) => HeifColorSpace::Rgb(RgbChroma::HdrRgbLe),
+        (false, true, false) => HeifColorSpace::Rgb(RgbChroma::HdrRgbBe),
+        (true, true, true) => HeifColorSpace::Rgb(RgbChroma::HdrRgbaLe),
+        (true, true, false) => HeifColorSpace::Rgb(RgbChroma::HdrRgbaBe),
+    }
+}
+
+fn heif_bytes_per_pixel(has_alpha: bool, high_bit_depth: bool) -> usize {
+    let channels = if has_alpha { 4 } else { 3 };
+    let bytes_per_channel = if high_bit_depth { 2 } else { 1 };
+    channels * bytes_per_channel
+}
+
+fn copy_heif_interleaved_plane(plane: &Plane<&[u8]>, bytes_per_pixel: usize) -> Result<Vec<u8>> {
+    if plane.stride == 0 {
+        return Err(anyhow!("HEIF row stride is zero"));
+    }
+    let width = plane.width as usize;
+    let height = plane.height as usize;
+    let row_size = width
+        .checked_mul(bytes_per_pixel)
+        .ok_or_else(|| anyhow!("HEIF image row size overflows usize"))?;
+    if row_size > plane.stride {
+        return Err(anyhow!(
+            "HEIF row stride {} is smaller than row size {}",
+            plane.stride,
+            row_size
+        ));
+    }
+    let expected_len = row_size
+        .checked_mul(height)
+        .ok_or_else(|| anyhow!("HEIF image size overflows usize"))?;
+    let mut pixels = Vec::with_capacity(expected_len);
+    for row in plane.data.chunks_exact(plane.stride).take(height) {
+        pixels.extend_from_slice(&row[..row_size]);
+    }
+    if pixels.len() != expected_len {
+        return Err(anyhow!("HEIF pixel data ended before all rows were copied"));
+    }
+    Ok(pixels)
+}
+
+fn native_u16_samples(bytes: &[u8]) -> Vec<u16> {
+    bytes
+        .chunks_exact(2)
+        .map(|chunk| u16::from_ne_bytes([chunk[0], chunk[1]]))
+        .collect()
+}
+
+fn image_buffer_from_raw<P, Container>(
+    width: u32,
+    height: u32,
+    buf: Container,
+    format_name: &str,
+) -> Result<image_rs::ImageBuffer<P, Container>>
+where
+    P: image_rs::Pixel,
+    Container: std::ops::Deref<Target = [P::Subpixel]>,
+{
+    image_rs::ImageBuffer::from_raw(width, height, buf)
+        .ok_or_else(|| anyhow!("decoded HEIF {format_name} data has the wrong length"))
+}
+
+fn decode_heif_image(path: &Path) -> Result<image_rs::DynamicImage> {
+    let lib_heif = libheif();
+    let bytes = fs::read(path)?;
+    let ctx = HeifContext::read_from_bytes(&bytes)?;
+    let handle = ctx.primary_image_handle()?;
+    let has_alpha = handle.has_alpha_channel();
+    let high_bit_depth = handle.luma_bits_per_pixel() > 8 || handle.chroma_bits_per_pixel() > 8;
+    let color_space = heif_target_color_space(has_alpha, high_bit_depth);
+    let decoded = lib_heif.decode(&handle, color_space, None)?;
+    let planes = decoded.planes();
+    let plane = planes
+        .interleaved
+        .ok_or_else(|| anyhow!("decoded HEIF did not provide interleaved pixel data"))?;
+    let width = plane.width;
+    let height = plane.height;
+    let bytes_per_pixel = heif_bytes_per_pixel(has_alpha, high_bit_depth);
+    let pixels = copy_heif_interleaved_plane(&plane, bytes_per_pixel)?;
+
+    match (has_alpha, high_bit_depth) {
+        (false, false) => Ok(image_rs::DynamicImage::ImageRgb8(image_buffer_from_raw(
+            width, height, pixels, "RGB8",
+        )?)),
+        (true, false) => Ok(image_rs::DynamicImage::ImageRgba8(image_buffer_from_raw(
+            width, height, pixels, "RGBA8",
+        )?)),
+        (false, true) => Ok(image_rs::DynamicImage::ImageRgb16(image_buffer_from_raw(
+            width,
+            height,
+            native_u16_samples(&pixels),
+            "RGB16",
+        )?)),
+        (true, true) => Ok(image_rs::DynamicImage::ImageRgba16(image_buffer_from_raw(
+            width,
+            height,
+            native_u16_samples(&pixels),
+            "RGBA16",
+        )?)),
+    }
+}
+
 fn decode_image_no_limits(path: &Path) -> Result<image_rs::DynamicImage> {
+    if is_heif_path(path) {
+        return decode_heif_image(path);
+    }
     let mut reader = image_rs::io::Reader::open(path)?;
     reader.limits(image_rs::io::Limits::no_limits());
     Ok(adjust_orientation_full(reader.decode()?, path))
@@ -777,6 +913,29 @@ mod tests {
         .concat();
         assert_eq!(rgba16_bytes_to_rgba8(&bytes), vec![0, 1, 128, 255]);
     }
+
+    #[test]
+    fn supported_image_extensions_include_heif_and_heic() {
+        assert!(is_supported_image_path(Path::new("photo.heif")));
+        assert!(is_supported_image_path(Path::new("photo.HEIC")));
+        assert!(is_heif_path(Path::new("photo.HEIF")));
+        assert!(!is_supported_image_path(Path::new("notes.txt")));
+    }
+
+    #[test]
+    fn copy_heif_interleaved_plane_removes_row_padding() {
+        let data = [1_u8, 2, 3, 4, 5, 6, 99, 99, 7, 8, 9, 10, 11, 12, 88, 88];
+        let plane = Plane {
+            data: &data[..],
+            width: 2,
+            height: 2,
+            stride: 8,
+            bits_per_pixel: 24,
+            storage_bits_per_pixel: 24,
+        };
+        let pixels = copy_heif_interleaved_plane(&plane, 3).unwrap();
+        assert_eq!(pixels, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    }
 }
 
 /// Scan a directory for raw files that have matching XMP sidecars.
@@ -875,15 +1034,8 @@ fn model(app: &App) -> Model {
             for entry in fs::read_dir(&pb).unwrap() {
                 let entry = entry.unwrap();
                 let path = entry.path();
-                if path.is_file() {
-                    if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-                        match ext.to_lowercase().as_str() {
-                            "jpg" | "jpeg" | "png" | "bmp" | "tiff" | "gif" | "webp" | "tif" => {
-                                image_paths.push(path.canonicalize().unwrap());
-                            }
-                            _ => {}
-                        }
-                    }
+                if path.is_file() && is_supported_image_path(&path) {
+                    image_paths.push(path.canonicalize().unwrap());
                 }
             }
         } else if pb.is_file() {

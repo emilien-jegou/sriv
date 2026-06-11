@@ -22,6 +22,12 @@ mostly vibe coded with AI tbh.
 
 to build and install the program system-wide on Linux, use one of the following methods:
 
+HEIF/HEIC support requires the libheif development package, for example:
+
+```bash
+sudo apt install libheif-dev
+```
+
 ```bash
 cargo build --release
 sudo install -Dm755 target/release/sriv /usr/local/bin/sriv
