@@ -1,1 +1,14 @@
-/target
+*
+
+!.envrc
+!Cargo.lock
+!Cargo.toml
+!README.md
+!devenv.lock
+!devenv.nix
+!devenv.yaml
+!flake.nix
+!src
+!src/**/*
+!wgpu-core-patch/
+!wgpu-core-patch/**/*
