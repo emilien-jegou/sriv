@@ -439,10 +439,11 @@ fn mouse_pressed(app: &App, model: &mut Model, button: MouseButton) {
                         if i >= grid.total() {
                             break;
                         }
+                        let orig_idx = model.displayed_indices[i];
                         let center = grid.index_center(i).unwrap();
                         let x = center.x;
                         let y = center.y;
-                        let (width, height) = if let Some(slot) = model.thumb_visible.get(&i) {
+                        let (width, height) = if let Some(slot) = model.thumb_visible.get(&orig_idx) {
                             let [tw, th] = slot.size;
                             (tw as f32, th as f32)
                         } else {
@@ -454,7 +455,7 @@ fn mouse_pressed(app: &App, model: &mut Model, button: MouseButton) {
                         let y_min = y - height / 2.0;
                         let y_max = y + height / 2.0;
                         if pos.x >= x_min && pos.x <= x_max && pos.y >= y_min && pos.y <= y_max {
-                            model.current = i;
+                            model.current = orig_idx;
                             model.selection_changed_at = Instant::now();
                             model.selection_pending = false;
                             return;
@@ -465,7 +466,6 @@ fn mouse_pressed(app: &App, model: &mut Model, button: MouseButton) {
         }
     }
 }
-
 /// Mouse wheel scroll handler to scroll thumbnails in thumbnail view.
 fn mouse_wheel(app: &App, model: &mut Model, delta: MouseScrollDelta, _phase: TouchPhase) {
     if model.terminal.visible && !model.terminal.sessions.is_empty() {
@@ -1080,7 +1080,8 @@ fn model(app: &App) -> Model {
     let (thumb_tx, thumb_rx) = channel::<ThumbnailUpdate>();
     let thumb_queue = ThumbRequestQueue::new();
     thumb_queue.enqueue_batch(0..image_paths.len());
-    let num_workers = rayon::current_num_threads().clamp(1, 8);
+
+    let num_workers = rayon::current_num_threads().clamp(1, 4);
     let shared_paths = Arc::new(image_paths.clone());
     let clip_engine = ClipEngine::new(cache_base.clone()).unwrap_or_else(|err| {
         eprintln!("Failed to initialize CLIP: {err}");
@@ -1191,12 +1192,13 @@ fn model(app: &App) -> Model {
     let (full_req_tx, full_req_rx) = unbounded::<usize>();
     // Channel for receiving loaded full-resolution image tile data
     let (full_resp_tx, full_resp_rx) = unbounded::<FullImageMessage>();
+
     // Spawn a pool of loader threads for full images: load, crop, and convert to raw tile data off the main thread
     {
         // Shared image paths for all workers
         let paths = Arc::new(image_paths.clone());
-        // Spawn worker threads matching thumbnail thread count
-        for _ in 0..num_workers {
+        // Spawn a pool of loader threads (2 is plenty and avoids high memory usage)
+        for _ in 0..2 {
             let req_rx = full_req_rx.clone();
             let resp_tx = full_resp_tx.clone();
             let paths = Arc::clone(&paths);
@@ -1256,8 +1258,12 @@ fn model(app: &App) -> Model {
     let ui_font = load_ui_font(ui_font_path.as_deref());
     // Channel for receiving command terminal updates from custom commands
     let (command_tx, command_rx) = channel::<CommandEvent>();
+
+    let displayed_indices = (0..image_paths.len()).collect();
+    let single_image_mode = image_paths.len() == 1;
     let mut model = Model {
         image_paths,
+        displayed_indices,
         ui_font,
         thumb_visible: HashMap::new(),
         thumb_data: HashMap::new(),
@@ -1272,7 +1278,7 @@ fn model(app: &App) -> Model {
         full_pending,
         full_textures,
         full_usage,
-        mode: Mode::Thumbnails,
+        mode: if single_image_mode { Mode::Single } else { Mode::Thumbnails },
         current: 0,
         thumb_size,
         gap: 10.0,
@@ -1281,7 +1287,7 @@ fn model(app: &App) -> Model {
         pan: vec2(0.0, 0.0),
         prev_window_rect: initial_rect,
         prev_scroll: 0.0,
-        fit_mode: false,
+        fit_mode: single_image_mode,
         selection_changed_at: Instant::now(),
         selection_pending: false,
         // Custom key bindings
@@ -1308,7 +1314,6 @@ fn model(app: &App) -> Model {
     update_thumbnail_requests(app, &mut model);
     model
 }
-
 fn main() -> Result<()> {
     // Launch the nannou application with our model initializer and update callback.
     nannou::app(model).update(update).run();
@@ -1358,43 +1363,43 @@ fn ensure_thumbnail_visible(app: &App, model: &mut Model, idx: usize) {
         return;
     };
     let grid = ThumbnailGrid::new(model, rect);
-    if let Some(row) = grid.row_for_index(idx) {
-        let view_height = grid.rect().h();
-        let mut scroll = model.scroll_offset;
-        let top = grid.row_top(row);
-        let bottom = grid.row_bottom(row);
-        if top < scroll {
-            scroll = top;
-        } else if bottom > scroll + view_height {
-            scroll = bottom - view_height;
+    let displayed_idx_opt = model.displayed_indices.iter().position(|&x| x == idx);
+    if let Some(displayed_idx) = displayed_idx_opt {
+        if let Some(row) = grid.row_for_index(displayed_idx) {
+            let view_height = grid.rect().h();
+            let mut scroll = model.scroll_offset;
+            let top = grid.row_top(row);
+            let bottom = grid.row_bottom(row);
+            if top < scroll {
+                scroll = top;
+            } else if bottom > scroll + view_height {
+                scroll = bottom - view_height;
+            }
+            model.scroll_offset = scroll.clamp(0.0, grid.max_scroll());
         }
-        model.scroll_offset = scroll.clamp(0.0, grid.max_scroll());
     }
 }
 
 fn advance_search(app: &App, model: &mut Model, delta: isize) {
     let mut target = None;
     if let Some(search) = model.search.as_mut() {
-        if search.results.is_empty() {
+        let threshold = 0.18;
+        let matching_results: Vec<&(usize, f32)> = search.results.iter()
+            .filter(|(_, score)| *score >= threshold)
+            .collect();
+        if matching_results.is_empty() {
             return;
         }
-        let len = search.results.len() as isize;
+        let len = matching_results.len() as isize;
         let mut idx = search.current as isize + delta;
-        if len == 0 {
-            return;
-        }
         idx = ((idx % len) + len) % len;
         search.current = idx as usize;
-        target = search
-            .results
-            .get(search.current)
-            .map(|(image_idx, _)| *image_idx);
+        target = matching_results.get(search.current).map(|&&(image_idx, _)| image_idx);
     }
     if let Some(idx) = target {
         focus_image(app, model, idx);
     }
 }
-
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let mut sum = 0.0f32;
     let len = a.len().min(b.len());
@@ -1429,7 +1434,14 @@ fn handle_text_result(app: &App, model: &mut Model, request_id: u64, embedding: 
             scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
             search.results = scored;
             search.current = 0;
-            focus_target = search.results.first().map(|(idx, _)| *idx);
+
+            let threshold = 0.18;
+            model.displayed_indices = search.results.iter()
+                .filter(|(_, score)| *score >= threshold)
+                .map(|(idx, _)| *idx)
+                .collect();
+
+            focus_target = model.displayed_indices.first().copied();
             if focus_target.is_none()
                 && model.clip_missing.is_empty()
                 && model.clip_inflight.is_empty()
@@ -1454,7 +1466,6 @@ fn update_search_with_image_embedding(app: &App, model: &mut Model, index: usize
                 .and_then(|entry| entry.clip_embedding.as_ref())
                 .or_else(|| model.pending_clip_embeddings.get(&index)),
         ) {
-            let had_results = !search.results.is_empty();
             let score = cosine_similarity(text_embed, img_embed);
             if let Some(entry) = search.results.iter_mut().find(|(idx, _)| *idx == index) {
                 entry.1 = score;
@@ -1464,20 +1475,21 @@ fn update_search_with_image_embedding(app: &App, model: &mut Model, index: usize
             search
                 .results
                 .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-            if !search.results.is_empty() {
+
+            let threshold = 0.18;
+            let had_results = !model.displayed_indices.is_empty();
+            model.displayed_indices = search.results.iter()
+                .filter(|(_, score)| *score >= threshold)
+                .map(|(idx, _)| *idx)
+                .collect();
+
+            if !model.displayed_indices.is_empty() {
                 search.error = None;
-                if search.current >= search.results.len() {
-                    search.current = search.results.len() - 1;
-                }
             }
-            if !had_results {
+            if !had_results && !model.displayed_indices.is_empty() {
                 search.current = 0;
-                focus_target = Some(index);
-            } else if let Some(pos) = search
-                .results
-                .iter()
-                .position(|(idx, _)| *idx == model.current)
-            {
+                focus_target = model.displayed_indices.first().copied();
+            } else if let Some(pos) = model.displayed_indices.iter().position(|&idx| idx == model.current) {
                 search.current = pos;
             }
         }
@@ -1486,7 +1498,6 @@ fn update_search_with_image_embedding(app: &App, model: &mut Model, index: usize
         focus_image(app, model, idx);
     }
 }
-
 fn handle_search_key(app: &App, model: &mut Model, key: Key) -> bool {
     let mods = app.keys.mods;
     if mods.ctrl() || mods.alt() || mods.logo() {
@@ -1498,20 +1509,18 @@ fn handle_search_key(app: &App, model: &mut Model, key: Key) -> bool {
             if search.focused {
                 return false;
             }
-            search.focused = true;
-            search.skip_next_char = true;
-        } else {
-            model.search = Some(SearchState {
-                input: String::new(),
-                focused: true,
-                skip_next_char: true,
-                results: Vec::new(),
-                current: 0,
-                pending_request: None,
-                error: None,
-                last_embedding: None,
-            });
         }
+        model.search = Some(SearchState {
+            input: String::new(),
+            focused: true,
+            skip_next_char: true,
+            results: Vec::new(),
+            current: 0,
+            pending_request: None,
+            error: None,
+            last_embedding: None,
+        });
+        model.displayed_indices = (0..model.image_paths.len()).collect();
         return true;
     }
 
@@ -1519,6 +1528,7 @@ fn handle_search_key(app: &App, model: &mut Model, key: Key) -> bool {
         match key {
             Key::Escape => {
                 model.search = None;
+                model.displayed_indices = (0..model.image_paths.len()).collect();
                 return true;
             }
             Key::Return => {
@@ -1579,6 +1589,7 @@ fn handle_search_key(app: &App, model: &mut Model, key: Key) -> bool {
                 }
                 if remove_search {
                     model.search = None;
+                    model.displayed_indices = (0..model.image_paths.len()).collect();
                 }
                 return true;
             }
@@ -1592,9 +1603,9 @@ fn handle_search_key(app: &App, model: &mut Model, key: Key) -> bool {
         match key {
             Key::Escape => {
                 model.search = None;
+                model.displayed_indices = (0..model.image_paths.len()).collect();
                 return true;
-            }
-            Key::N => {
+            }            Key::N => {
                 if matches!(model.mode, Mode::Thumbnails)
                     && model
                         .search
@@ -1648,11 +1659,17 @@ fn scroll_gallery_page(app: &App, model: &mut Model, direction: isize) {
     let jump_rows = (visible_rows / 2).max(1);
     let jump_items = jump_rows * grid.cols() as isize;
 
+    let displayed_current_opt = model.displayed_indices.iter().position(|&x| x == model.current);
+    let displayed_current = match displayed_current_opt {
+        Some(pos) => pos,
+        None => 0,
+    };
+
     let total = grid.total() as isize;
-    let mut new_idx = model.current as isize + direction * jump_items;
+    let mut new_idx = displayed_current as isize + direction * jump_items;
     new_idx = new_idx.clamp(0, total - 1);
 
-    model.current = new_idx as usize;
+    model.current = model.displayed_indices[new_idx as usize];
     model.selection_changed_at = Instant::now();
     model.selection_pending = false;
     ensure_thumbnail_visible(app, model, model.current);
@@ -1667,7 +1684,8 @@ fn handle_arrow(app: &App, model: &mut Model, dir: ArrowDirection, faster: bool)
     };
     match model.mode {
         Mode::Thumbnails => {
-            if len == 0 {
+            let total = model.displayed_indices.len();
+            if total == 0 {
                 return false;
             }
             let grid = ThumbnailGrid::new(model, rect);
@@ -1675,9 +1693,13 @@ fn handle_arrow(app: &App, model: &mut Model, dir: ArrowDirection, faster: bool)
             if cols == 0 {
                 return false;
             }
-            let current = model.current.min(len - 1);
-            let mut row = current / cols;
-            let mut col = current % cols;
+            let displayed_current_opt = model.displayed_indices.iter().position(|&x| x == model.current);
+            let displayed_current = match displayed_current_opt {
+                Some(pos) => pos,
+                None => 0,
+            };
+            let mut row = displayed_current / cols;
+            let mut col = displayed_current % cols;
             let total_rows = grid.rows();
             let mut changed = false;
             match dir {
@@ -1722,15 +1744,14 @@ fn handle_arrow(app: &App, model: &mut Model, dir: ArrowDirection, faster: bool)
             }
             if changed {
                 let mut idx = row * cols + col;
-                if idx >= len {
-                    idx = len - 1;
+                if idx >= total {
+                    idx = total - 1;
                 }
-                model.current = idx;
+                model.current = model.displayed_indices[idx];
             }
             // Compute target row and column
             false
-        }
-        Mode::Single => {
+        }        Mode::Single => {
             let pan_step = if faster { 200.0 } else { 50.0 };
             match dir {
                 ArrowDirection::Left | ArrowDirection::Right => {                    if let Some(tex) = model.full_textures.get(&model.current) {
@@ -1848,7 +1869,13 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
             Key::Q => {
                 match model.mode {
                     Mode::Thumbnails => app.quit(),
-                    Mode::Single => model.mode = Mode::Thumbnails,
+                    Mode::Single => {
+                        if model.image_paths.len() == 1 {
+                            app.quit();
+                        } else {
+                            model.mode = Mode::Thumbnails;
+                        }
+                    }
                 }
             }
             Key::G => {
@@ -1918,7 +1945,9 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
                         apply_fit(app, model);
                     }
                     Mode::Single => {
-                        model.mode = Mode::Thumbnails;
+                        if model.image_paths.len() > 1 {
+                            model.mode = Mode::Thumbnails;
+                        }
                     }
                 }
             }
@@ -1944,12 +1973,12 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
                     window.set_fullscreen(!is_fs);
                 }
             }
-            Key::Equals | Key::NumpadAdd | Key::I => {
+            Key::Equals | Key::NumpadAdd | Key::O => {
                 if let Mode::Single = model.mode {
                     model.zoom = (model.zoom * 1.2).clamp(0.01, 10.0);
                 }
             }
-            Key::Minus | Key::NumpadSubtract | Key::O => {
+            Key::Minus | Key::NumpadSubtract | Key::I => {
                 if let Mode::Single = model.mode {
                     model.zoom = (model.zoom / 1.2).clamp(0.01, 10.0);
                 }
@@ -2504,7 +2533,7 @@ fn update_thumbnail_requests(app: &App, model: &mut Model) {
     if !matches!(model.mode, Mode::Thumbnails) {
         return;
     }
-    let total = model.image_paths.len();
+    let total = model.displayed_indices.len();
     if total == 0 {
         model.thumb_visible.clear();
         return;
@@ -2530,12 +2559,26 @@ fn update_thumbnail_requests(app: &App, model: &mut Model) {
     if window_changed || scroll_changed {
         model
             .thumb_queue
-            .reprioritize(|idx| grid.viewport_priority(idx));
+            .reprioritize(|idx| {
+                let disp_idx_opt = model.displayed_indices.iter().position(|&x| x == idx);
+                if let Some(disp_idx) = disp_idx_opt {
+                    grid.viewport_priority(disp_idx)
+                } else {
+                    f32::MAX
+                }
+            });
     }
-    let visible_set: HashSet<usize> = visible.iter().copied().collect();
+    
+    let mut visible_set_orig = HashSet::new();
+    for &idx in &visible {
+        if let Some(&orig_idx) = model.displayed_indices.get(idx) {
+            visible_set_orig.insert(orig_idx);
+        }
+    }
+
     let mut to_remove = Vec::new();
     for idx in model.thumb_visible.keys() {
-        if !visible_set.contains(idx) {
+        if !visible_set_orig.contains(idx) {
             to_remove.push(*idx);
         }
     }
@@ -2544,30 +2587,30 @@ fn update_thumbnail_requests(app: &App, model: &mut Model) {
     }
 
     for idx in visible {
-        let center = grid.index_center(idx).unwrap_or(vec2(0.0, 0.0));
-        if let Some(slot) = model.thumb_visible.get_mut(&idx) {
-            slot.center = center;
-            continue;
-        }
-        if let Some(entry) = model.thumb_data.get(&idx) {
-            let texture = wgpu::Texture::from_image(app, &entry.image);
-            let size = texture.size();
-            let generation = model.next_thumb_generation;
-            model.next_thumb_generation = model.next_thumb_generation.wrapping_add(1);
-            model.thumb_visible.insert(
-                idx,
-                ThumbnailTexture {
-                    texture,
-                    center,
-                    size,
-                    generation,
-                },
-            );
+        if let Some(&orig_idx) = model.displayed_indices.get(idx) {
+            let center = grid.index_center(idx).unwrap_or(vec2(0.0, 0.0));
+            if let Some(slot) = model.thumb_visible.get_mut(&orig_idx) {
+                slot.center = center;
+                continue;
+            }
+            if let Some(entry) = model.thumb_data.get(&orig_idx) {
+                let texture = wgpu::Texture::from_image(app, &entry.image);
+                let size = texture.size();
+                let generation = model.next_thumb_generation;
+                model.next_thumb_generation = model.next_thumb_generation.wrapping_add(1);
+                model.thumb_visible.insert(
+                    orig_idx,
+                    ThumbnailTexture {
+                        texture,
+                        center,
+                        size,
+                        generation,
+                    },
+                );
+            }
         }
     }
-}
-
-fn handle_thumbnail_update(app: &App, model: &mut Model, update: ThumbnailUpdate) {
+}fn handle_thumbnail_update(app: &App, model: &mut Model, update: ThumbnailUpdate) {
     let ThumbnailUpdate {
         index,
         image,
@@ -2609,7 +2652,9 @@ fn detect_file_changes(app: &App, model: &mut Model) {
     if matches!(model.mode, Mode::Thumbnails) {
         if let Some(rect) = current_window_rect(app, model) {
             for idx in ThumbnailGrid::new(model, rect).visible_indices() {
-                candidates.insert(idx);
+                if let Some(&orig_idx) = model.displayed_indices.get(idx) {
+                    candidates.insert(orig_idx);
+                }
             }
         }
     }
@@ -2623,7 +2668,6 @@ fn detect_file_changes(app: &App, model: &mut Model) {
         check_image_modification(model, idx);
     }
 }
-
 fn check_image_modification(model: &mut Model, idx: usize) {
     if idx >= model.image_paths.len() {
         return;
@@ -2710,79 +2754,77 @@ fn view(app: &App, model: &Model, frame: Frame) {
                             None => continue,
                         };
 
-                        if let Some(slot) = model.thumb_visible.get(&i) {
-                            let [tw, th] = slot.size;
-                            let w = tw as f32;
-                            let h = th as f32;
-                            let lod_variation =
-                                1.0 + ((slot.generation % 1_000_000) as f32) / 1_000_000.0;
-                            // nannou caches bind groups by (texture_id, sampler_desc); without the
-                            // generation in the sampler, a recycled texture ID could re-use a stale
-                            // bind group pointing at old GPU contents.
-                            let sampler_desc = wgpu::SamplerDescriptor {
-                                label: Some("thumbnail-sampler"),
-                                address_mode_u: wgpu::AddressMode::ClampToEdge,
-                                address_mode_v: wgpu::AddressMode::ClampToEdge,
-                                address_mode_w: wgpu::AddressMode::ClampToEdge,
-                                mag_filter: wgpu::FilterMode::Linear,
-                                min_filter: wgpu::FilterMode::Linear,
-                                mipmap_filter: wgpu::FilterMode::Nearest,
-                                lod_min_clamp: 0.0,
-                                lod_max_clamp: lod_variation,
-                                compare: None,
-                                anisotropy_clamp: 1,
-                                border_color: None,
-                            };
-                            draw.sampler(sampler_desc)
-                                .texture(&slot.texture)
-                                .x_y(center.x, center.y)
-                                .w_h(w, h);
+                        if let Some(&orig_idx) = model.displayed_indices.get(i) {
+                            if let Some(slot) = model.thumb_visible.get(&orig_idx) {
+                                let [tw, th] = slot.size;
+                                let w = tw as f32;
+                                let h = th as f32;
+                                let lod_variation =
+                                    1.0 + ((slot.generation % 1_000_000) as f32) / 1_000_000.0;
+                                let sampler_desc = wgpu::SamplerDescriptor {
+                                    label: Some("thumbnail-sampler"),
+                                    address_mode_u: wgpu::AddressMode::ClampToEdge,
+                                    address_mode_v: wgpu::AddressMode::ClampToEdge,
+                                    address_mode_w: wgpu::AddressMode::ClampToEdge,
+                                    mag_filter: wgpu::FilterMode::Linear,
+                                    min_filter: wgpu::FilterMode::Linear,
+                                    mipmap_filter: wgpu::FilterMode::Nearest,
+                                    lod_min_clamp: 0.0,
+                                    lod_max_clamp: lod_variation,
+                                    compare: None,
+                                    anisotropy_clamp: 1,
+                                    border_color: None,
+                                };
+                                draw.sampler(sampler_desc)
+                                    .texture(&slot.texture)
+                                    .x_y(center.x, center.y)
+                                    .w_h(w, h);
 
-                            if model.thumb_has_xmp.get(i).copied().unwrap_or(false) {
-                                let icon_w = 40.0;
-                                let icon_h = 20.0;
-                                let margin = 6.0;
-                                let icon_center_x = center.x + w / 2.0 - icon_w / 2.0 - margin;
-                                let icon_center_y = center.y + h / 2.0 - icon_h / 2.0 - margin;
-                                draw.rect()
-                                    .x_y(icon_center_x, icon_center_y)
-                                    .w_h(icon_w, icon_h)
-                                    .color(srgba(1.0, 0.0, 0.0, 0.85));
-                                draw.text("XMP")
-                                    .font(model.ui_font.clone())
-                                    .font_size(12)
-                                    .w_h(icon_w, icon_h)
-                                    .x_y(icon_center_x, icon_center_y - 1.0)
-                                    .color(WHITE);
-                            }
-                            if i == model.current {
-                                draw.rect()
-                                    .x_y(center.x, center.y)
-                                    .w_h(w + 4.0, h + 4.0)
-                                    .no_fill()
-                                    .stroke(WHITE)
-                                    .stroke_weight(2.0);
-                            }
-                        } else {
-                            let thumb_w = model.thumb_size as f32;
-                            let thumb_h = model.thumb_size as f32;
-                            draw.rect()
-                                .x_y(center.x, center.y)
-                                .w_h(thumb_w, thumb_h)
-                                .color(srgba(0.5, 0.5, 0.5, 1.0));
-                            if i == model.current {
+                                if model.thumb_has_xmp.get(orig_idx).copied().unwrap_or(false) {
+                                    let icon_w = 40.0;
+                                    let icon_h = 20.0;
+                                    let margin = 6.0;
+                                    let icon_center_x = center.x + w / 2.0 - icon_w / 2.0 - margin;
+                                    let icon_center_y = center.y + h / 2.0 - icon_h / 2.0 - margin;
+                                    draw.rect()
+                                        .x_y(icon_center_x, icon_center_y)
+                                        .w_h(icon_w, icon_h)
+                                        .color(srgba(1.0, 0.0, 0.0, 0.85));
+                                    draw.text("XMP")
+                                        .font(model.ui_font.clone())
+                                        .font_size(12)
+                                        .w_h(icon_w, icon_h)
+                                        .x_y(icon_center_x, icon_center_y - 1.0)
+                                        .color(WHITE);
+                                }
+                                if orig_idx == model.current {
+                                    draw.rect()
+                                        .x_y(center.x, center.y)
+                                        .w_h(w + 4.0, h + 4.0)
+                                        .no_fill()
+                                        .stroke(WHITE)
+                                        .stroke_weight(2.0);
+                                }
+                            } else {
+                                let thumb_w = model.thumb_size as f32;
+                                let thumb_h = model.thumb_size as f32;
                                 draw.rect()
                                     .x_y(center.x, center.y)
-                                    .w_h(thumb_w + 4.0, thumb_h + 4.0)
-                                    .no_fill()
-                                    .stroke(WHITE)
-                                    .stroke_weight(2.0);
+                                    .w_h(thumb_w, thumb_h)
+                                    .color(srgba(0.5, 0.5, 0.5, 1.0));
+                                if orig_idx == model.current {
+                                    draw.rect()
+                                        .x_y(center.x, center.y)
+                                        .w_h(thumb_w + 4.0, thumb_h + 4.0)
+                                        .no_fill()
+                                        .stroke(WHITE)
+                                        .stroke_weight(2.0);
+                                }
                             }
                         }
                     }
                 }
-            }
-            // Bottom info bar in thumbnail mode: filename and index/total
+            }            // Bottom info bar in thumbnail mode: filename and index/total
             let bar_h = 20.0;
             let bar_y = -rect.h() / 2.0 + bar_h / 2.0;
             // Background
@@ -2799,7 +2841,12 @@ fn view(app: &App, model: &Model, frame: Frame) {
                 .left_justify()
                 .color(WHITE);
             // Index of selected image
-            let count = format!("{}/{}", model.current + 1, model.image_paths.len());
+            let disp_pos_opt = model.displayed_indices.iter().position(|&idx| idx == model.current);
+            let count = if let Some(pos) = disp_pos_opt {
+                format!("{}/{}", pos + 1, model.displayed_indices.len())
+            } else {
+                format!("-/{}", model.displayed_indices.len())
+            };
             draw.text(&count)
                 .font(model.ui_font.clone())
                 .font_size(14)
@@ -2807,8 +2854,7 @@ fn view(app: &App, model: &Model, frame: Frame) {
                 .x_y(0.0, bar_y)
                 .right_justify()
                 .color(WHITE);
-        }
-        Mode::Single => {
+        }        Mode::Single => {
             // Attempt to draw the full-resolution tiled texture if loaded;
             // otherwise display a loading message.
             if let Some(tex) = model.full_textures.get(&model.current) {

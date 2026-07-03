@@ -23,9 +23,8 @@ impl ThumbnailGrid {
             cols = 1;
         }
         let cols = cols as usize;
-        let total = model.image_paths.len();
-        let rows = if cols == 0 { 0 } else { total.div_ceil(cols) };
-        let half_gap = model.gap / 2.0;
+        let total = model.displayed_indices.len();
+        let rows = if cols == 0 { 0 } else { total.div_ceil(cols) };        let half_gap = model.gap / 2.0;
         Self {
             rect,
             cell,

@@ -345,8 +345,8 @@ pub struct TerminalState {
 
 pub struct Model {
     pub image_paths: Vec<PathBuf>,
-    pub ui_font: Font,
-    pub thumb_visible: HashMap<usize, ThumbnailTexture>,
+    pub displayed_indices: Vec<usize>,
+    pub ui_font: Font,    pub thumb_visible: HashMap<usize, ThumbnailTexture>,
     pub thumb_data: HashMap<usize, ThumbnailEntry>,
     pub thumb_has_xmp: Vec<bool>,
     pub thumb_rx: Receiver<ThumbnailUpdate>,

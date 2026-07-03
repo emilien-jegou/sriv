@@ -1,3 +1,11 @@
+use anyhow::{anyhow, Context};
+use candle::utils::cuda_is_available;
+use candle::{DType, Device, Tensor};
+use candle_nn::VarBuilder;
+use candle_transformers::models::clip::{self, ClipModel};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender, TryRecvError};
+use nannou::image::{imageops::FilterType, DynamicImage, GenericImageView, RgbImage};
+use sha1::Sha1;
 use std::convert::TryInto;
 use std::fmt;
 use std::fs::{self, File};
@@ -6,14 +14,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-
-use anyhow::{anyhow, Context, Result};
-use candle::{utils::cuda_is_available, DType, Device, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::models::clip::{self, ClipModel};
-use crossbeam_channel::{unbounded, Receiver, Sender, TryRecvError};
-use nannou::image::{imageops::FilterType, DynamicImage, GenericImageView, RgbImage};
-use sha1::Sha1;
 use tokenizers::Tokenizer;
 
 const MAX_IMAGE_BATCH: usize = 16;
@@ -54,14 +54,15 @@ enum ClipJob {
 /// Manages CLIP inference in a background thread and caching of embeddings.
 #[derive(Debug)]
 pub struct ClipEngine {
-    job_tx: Sender<ClipJob>,
+    image_tx: Sender<ClipJob>,
+    text_tx: Sender<ClipJob>,
     result_rx: Receiver<ClipEvent>,
     using_cuda: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
 pub struct ClipRequestSender {
-    job_tx: Sender<ClipJob>,
+    image_tx: Sender<ClipJob>,
 }
 
 impl ClipRequestSender {
@@ -70,8 +71,8 @@ impl ClipRequestSender {
         index: usize,
         image_path: PathBuf,
         thumbnail: RgbImage,
-    ) -> Result<()> {
-        self.job_tx
+    ) -> anyhow::Result<()> {
+        self.image_tx
             .send(ClipJob::Image {
                 index,
                 image_path,
@@ -90,17 +91,14 @@ struct ClipWorkerContext {
 }
 
 impl ClipEngine {
-    pub fn new(cache_base: PathBuf) -> Result<Self> {
-        let (job_tx, job_rx) = unbounded::<ClipJob>();
+    pub fn new(cache_base: PathBuf) -> anyhow::Result<Self> {
+        let (image_tx, image_rx) = bounded::<ClipJob>(16);
+        let (text_tx, text_rx) = unbounded::<ClipJob>();
         let (result_tx, result_rx) = unbounded::<ClipEvent>();
         let config = clip::ClipConfig::vit_base_patch32();
         let want_cuda = cuda_is_available();
         let using_cuda = Arc::new(AtomicBool::new(false));
-        let worker_count = if want_cuda {
-            1
-        } else {
-            num_cpus::get().clamp(1, 8)
-        };
+        let worker_count = 1;
         for worker_idx in 0..worker_count {
             let worker_ctx = ClipWorkerContext {
                 cache_base: cache_base.clone(),
@@ -108,20 +106,25 @@ impl ClipEngine {
                 result_tx: result_tx.clone(),
                 device_flag: using_cuda.clone(),
             };
-            let worker_rx = job_rx.clone();
+            let worker_image_rx = image_rx.clone();
+            let worker_text_rx = text_rx.clone();
             thread::Builder::new()
                 .name(format!("clip-worker-{worker_idx}"))
                 .spawn(move || {
-                    if let Err(err) = run_worker(worker_ctx, worker_rx, want_cuda) {
+                    if let Err(err) =
+                        run_worker(worker_ctx, worker_image_rx, worker_text_rx, want_cuda)
+                    {
                         eprintln!("clip worker terminated: {err:#}");
                     }
                 })
                 .context("failed to spawn clip worker thread")?;
         }
-        drop(job_rx);
+        drop(image_rx);
+        drop(text_rx);
         drop(result_tx);
         Ok(Self {
-            job_tx,
+            image_tx,
+            text_tx,
             result_rx,
             using_cuda,
         })
@@ -129,13 +132,13 @@ impl ClipEngine {
 
     pub fn request_sender(&self) -> ClipRequestSender {
         ClipRequestSender {
-            job_tx: self.job_tx.clone(),
+            image_tx: self.image_tx.clone(),
         }
     }
 
     /// Requests a text embedding for the given query string.
-    pub fn request_text(&self, request_id: u64, query: String) -> Result<()> {
-        self.job_tx
+    pub fn request_text(&self, request_id: u64, query: String) -> anyhow::Result<()> {
+        self.text_tx
             .send(ClipJob::Text { request_id, query })
             .map_err(|err| anyhow!("failed to queue clip text job: {err}"))
     }
@@ -154,7 +157,12 @@ impl ClipEngine {
     }
 }
 
-fn run_worker(ctx: ClipWorkerContext, job_rx: Receiver<ClipJob>, use_cuda: bool) -> Result<()> {
+fn run_worker(
+    ctx: ClipWorkerContext,
+    image_rx: Receiver<ClipJob>,
+    text_rx: Receiver<ClipJob>,
+    use_cuda: bool,
+) -> anyhow::Result<()> {
     let ClipWorkerContext {
         cache_base,
         config,
@@ -194,63 +202,101 @@ fn run_worker(ctx: ClipWorkerContext, job_rx: Receiver<ClipJob>, use_cuda: bool)
         VarBuilder::from_mmaped_safetensors(std::slice::from_ref(&model_file), DType::F32, &device)?
     };
     let model = ClipModel::new(vb, &config)?;
-    let mut channel_closed = false;
-    while let Ok(job) = job_rx.recv() {
-        match job {
-            ClipJob::Image {
-                index,
-                image_path,
-                thumbnail,
-            } => {
-                let mut batch = vec![(index, image_path, thumbnail)];
-                let mut deferred_job: Option<ClipJob> = None;
-                while batch.len() < MAX_IMAGE_BATCH {
-                    match job_rx.try_recv() {
-                        Ok(ClipJob::Image {
-                            index,
-                            image_path,
-                            thumbnail,
-                        }) => batch.push((index, image_path, thumbnail)),
-                        Ok(other) => {
-                            deferred_job = Some(other);
-                            break;
-                        }
-                        Err(TryRecvError::Empty) => break,
-                        Err(TryRecvError::Disconnected) => {
-                            channel_closed = true;
-                            break;
-                        }
-                    }
-                }
-                let batch_ctx = ImageBatchContext {
-                    cache_base: &cache_base,
-                    model: &model,
-                    device: &device,
-                    clip_image_size: config.image_size,
-                    result_tx: &result_tx,
-                };
-                process_image_batch(batch, &batch_ctx);
-                if let Some(job) = deferred_job {
-                    match job {
-                        ClipJob::Text { request_id, query } => handle_text_job(
-                            request_id, &query, &model, &tokenizer, pad_id, &device, &result_tx,
-                        ),
-                        ClipJob::Image {
-                            index,
-                            image_path,
-                            thumbnail,
-                        } => process_image_batch(vec![(index, image_path, thumbnail)], &batch_ctx),
-                    }
-                }
-                if channel_closed {
-                    break;
-                }
-            }
-            ClipJob::Text { request_id, query } => {
+
+    loop {
+        // 1. Always prioritize and drain pending text query jobs first
+        match text_rx.try_recv() {
+            Ok(ClipJob::Text { request_id, query }) => {
                 handle_text_job(
                     request_id, &query, &model, &tokenizer, pad_id, &device, &result_tx,
                 );
+                continue;
             }
+            Ok(ClipJob::Image { .. }) => {} // Ignore unexpected image jobs on text channel
+            Err(TryRecvError::Disconnected) => break,
+            Err(TryRecvError::Empty) => {}
+        }
+
+        // 2. Wait on either a text job or an image job
+        let mut sel = crossbeam_channel::Select::new();
+        let text_idx = sel.recv(&text_rx);
+        let image_idx = sel.recv(&image_rx);
+        let oper = sel.select();
+        match oper.index() {
+            i if i == text_idx => {
+                match oper.recv(&text_rx) {
+                    Ok(ClipJob::Text { request_id, query }) => {
+                        handle_text_job(
+                            request_id, &query, &model, &tokenizer, pad_id, &device, &result_tx,
+                        );
+                    }
+                    _ => break, // Channel disconnected
+                }
+            }
+            i if i == image_idx => {
+                match oper.recv(&image_rx) {
+                    Ok(ClipJob::Image {
+                        index,
+                        image_path,
+                        thumbnail,
+                    }) => {
+                        let mut batch = vec![(index, image_path, thumbnail)];
+                        let mut deferred_job: Option<ClipJob> = None;
+                        while batch.len() < MAX_IMAGE_BATCH {
+                            // Check text queries first to prioritize them
+                            match text_rx.try_recv() {
+                                Ok(ClipJob::Text { request_id, query }) => {
+                                    deferred_job = Some(ClipJob::Text { request_id, query });
+                                    break;
+                                }
+                                Ok(ClipJob::Image { .. }) => {} // Ignore unexpected image jobs on text channel
+                                Err(TryRecvError::Disconnected) => break,
+                                Err(TryRecvError::Empty) => {}
+                            }
+
+                            match image_rx.try_recv() {
+                                Ok(ClipJob::Image {
+                                    index,
+                                    image_path,
+                                    thumbnail,
+                                }) => batch.push((index, image_path, thumbnail)),
+                                Ok(other) => {
+                                    deferred_job = Some(other);
+                                    break;
+                                }
+                                Err(TryRecvError::Empty) => break,
+                                Err(TryRecvError::Disconnected) => break,
+                            }
+                        }
+                        let batch_ctx = ImageBatchContext {
+                            cache_base: &cache_base,
+                            model: &model,
+                            device: &device,
+                            clip_image_size: config.image_size,
+                            result_tx: &result_tx,
+                        };
+                        process_image_batch(batch, &batch_ctx);
+                        if let Some(job) = deferred_job {
+                            match job {
+                                ClipJob::Text { request_id, query } => handle_text_job(
+                                    request_id, &query, &model, &tokenizer, pad_id, &device,
+                                    &result_tx,
+                                ),
+                                ClipJob::Image {
+                                    index,
+                                    image_path,
+                                    thumbnail,
+                                } => process_image_batch(
+                                    vec![(index, image_path, thumbnail)],
+                                    &batch_ctx,
+                                ),
+                            }
+                        }
+                    }
+                    _ => break, // Channel disconnected
+                }
+            }
+            _ => unreachable!(),
         }
     }
     Ok(())
@@ -376,7 +422,7 @@ fn process_text_job(
     tokenizer: &Tokenizer,
     pad_id: u32,
     device: &Device,
-) -> Result<Vec<f32>> {
+) -> anyhow::Result<Vec<f32>> {
     let ids = tokenizer
         .encode(query, true)
         .map_err(anyhow::Error::msg)?
@@ -400,7 +446,7 @@ fn process_text_job(
     Ok(embedding)
 }
 
-fn tensor_from_thumbnail(thumb: RgbImage, clip_image_size: usize) -> Result<Tensor> {
+fn tensor_from_thumbnail(thumb: RgbImage, clip_image_size: usize) -> anyhow::Result<Tensor> {
     let mut dyn_thumb = DynamicImage::ImageRgb8(thumb);
     if dyn_thumb.width() != clip_image_size as u32 || dyn_thumb.height() != clip_image_size as u32 {
         dyn_thumb = dyn_thumb.resize_to_fill(
@@ -419,13 +465,13 @@ fn tensor_from_thumbnail(thumb: RgbImage, clip_image_size: usize) -> Result<Tens
     Ok(tensor)
 }
 
-fn image_embeddings(model: &ClipModel, tensor: Tensor) -> Result<Vec<Vec<f32>>> {
+fn image_embeddings(model: &ClipModel, tensor: Tensor) -> anyhow::Result<Vec<Vec<f32>>> {
     let features = model.get_image_features(&tensor)?;
     let features = clip::div_l2_norm(&features)?;
     Ok(features.to_vec2::<f32>()?)
 }
 
-fn write_embedding(path: &Path, embedding: &[f32]) -> Result<()> {
+fn write_embedding(path: &Path, embedding: &[f32]) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -444,7 +490,10 @@ fn write_embedding(path: &Path, embedding: &[f32]) -> Result<()> {
     Ok(())
 }
 
-pub fn load_cached_embedding(cache_base: &Path, image_path: &Path) -> Result<Option<Vec<f32>>> {
+pub fn load_cached_embedding(
+    cache_base: &Path,
+    image_path: &Path,
+) -> anyhow::Result<Option<Vec<f32>>> {
     let embed_path = cache_file_path(cache_base, image_path, "clip");
     let embed_meta = match fs::metadata(&embed_path) {
         Ok(meta) => meta,
