@@ -1634,9 +1634,33 @@ enum ArrowDirection {
     Down,
 }
 
+fn scroll_gallery_page(app: &App, model: &mut Model, direction: isize) {
+    let Some(rect) = current_window_rect(app, model) else { return; };
+    let grid = ThumbnailGrid::new(model, rect);
+    if grid.cols() == 0 || grid.total() == 0 { return; }
+
+    let visible_rows = if let Some((min, max)) = grid.visible_rows() {
+        (max.saturating_sub(min)).max(1) as isize
+    } else {
+        1
+    };
+
+    let jump_rows = (visible_rows / 2).max(1);
+    let jump_items = jump_rows * grid.cols() as isize;
+
+    let total = grid.total() as isize;
+    let mut new_idx = model.current as isize + direction * jump_items;
+    new_idx = new_idx.clamp(0, total - 1);
+
+    model.current = new_idx as usize;
+    model.selection_changed_at = Instant::now();
+    model.selection_pending = false;
+    ensure_thumbnail_visible(app, model, model.current);
+}
+
 /// Handle arrow navigation in both thumbnail and single modes.
 /// Returns true if event was fully consumed (e.g., panned in single mode).
-fn handle_arrow(app: &App, model: &mut Model, dir: ArrowDirection) -> bool {
+fn handle_arrow(app: &App, model: &mut Model, dir: ArrowDirection, faster: bool) -> bool {
     let len = model.image_paths.len();
     let Some(rect) = current_window_rect(app, model) else {
         return matches!(model.mode, Mode::Single);
@@ -1707,10 +1731,9 @@ fn handle_arrow(app: &App, model: &mut Model, dir: ArrowDirection) -> bool {
             false
         }
         Mode::Single => {
-            let pan_step = 200.0;
+            let pan_step = if faster { 200.0 } else { 50.0 };
             match dir {
-                ArrowDirection::Left | ArrowDirection::Right => {
-                    if let Some(tex) = model.full_textures.get(&model.current) {
+                ArrowDirection::Left | ArrowDirection::Right => {                    if let Some(tex) = model.full_textures.get(&model.current) {
                         let [tw, _] = tex.size();
                         let disp_w = tw as f32 * model.zoom;
                         if disp_w > rect.w() {
@@ -1815,29 +1838,25 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
     }
 
     let len = model.image_paths.len();
-    if app.keys.mods == ModifiersState::empty() {
+    let mods = app.keys.mods;
+    let no_mods = mods == ModifiersState::empty();
+    let ctrl_only = mods.ctrl() && !mods.shift() && !mods.alt() && !mods.logo();
+    let shift_only = mods.shift() && !mods.ctrl() && !mods.alt() && !mods.logo();
+
+    if no_mods {
         match key {
-            // Quit on 'q'
             Key::Q => {
-                // Exit the application
-                app.quit();
+                match model.mode {
+                    Mode::Thumbnails => app.quit(),
+                    Mode::Single => model.mode = Mode::Thumbnails,
+                }
             }
-            // g/G: jump to first/last in thumbnail mode
             Key::G => {
                 if let Mode::Thumbnails = model.mode {
-                    let len = model.image_paths.len();
-                    // if Shift+G, go to last thumbnail; otherwise go to first
-                    if app.keys.mods.shift() {
-                        if len > 0 {
-                            model.current = len - 1;
-                        }
-                    } else {
-                        model.current = 0;
-                    }
+                    model.current = 0;
                 }
             }
             Key::N => {
-                // Next image in single-image mode
                 if let Mode::Single = model.mode {
                     if model.current + 1 < len {
                         navigate_to(app, model, model.current + 1);
@@ -1845,21 +1864,18 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
                 }
             }
             Key::P => {
-                // Previous image in single-image mode
                 if let Mode::Single = model.mode {
                     if model.current > 0 {
                         navigate_to(app, model, model.current - 1);
                     }
                 }
             }
-            // Skip 10 images forward
             Key::RBracket => {
                 if let Mode::Single = model.mode {
                     let new_idx = (model.current + 10).min(len.saturating_sub(1));
                     navigate_to(app, model, new_idx);
                 }
             }
-            // Skip 10 images backward
             Key::LBracket => {
                 if let Mode::Single = model.mode {
                     let new_idx = model.current.saturating_sub(10);
@@ -1867,31 +1883,29 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
                 }
             }
             Key::H | Key::Left => {
-                if handle_arrow(app, model, ArrowDirection::Left) {
+                if handle_arrow(app, model, ArrowDirection::Left, false) {
                     return;
                 }
             }
             Key::L | Key::Right => {
-                if handle_arrow(app, model, ArrowDirection::Right) {
+                if handle_arrow(app, model, ArrowDirection::Right, false) {
                     return;
                 }
             }
             Key::K | Key::Up => {
-                if handle_arrow(app, model, ArrowDirection::Up) {
+                if handle_arrow(app, model, ArrowDirection::Up, false) {
                     return;
                 }
             }
             Key::J | Key::Down => {
-                if handle_arrow(app, model, ArrowDirection::Down) {
+                if handle_arrow(app, model, ArrowDirection::Down, false) {
                     return;
                 }
             }
-            Key::Return => {
-                // Toggle between thumbnail and single-image modes.
+
+            Key::Return | Key::Space => {
                 match model.mode {
                     Mode::Thumbnails => {
-                        // Pre-load current and adjacent images, then fit
-                        let len = model.image_paths.len();
                         let idx = model.current;
                         request_full_texture(model, idx);
                         if idx > 0 {
@@ -1900,7 +1914,6 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
                         if idx + 1 < len {
                             request_full_texture(model, idx + 1);
                         }
-                        // Enter single mode and fit image to window
                         model.mode = Mode::Single;
                         apply_fit(app, model);
                     }
@@ -1909,7 +1922,6 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
                     }
                 }
             }
-            // Fit single image to window
             Key::W => {
                 if let Mode::Single = model.mode {
                     if let Some(rect) = current_window_rect(app, model) {
@@ -1926,15 +1938,23 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
                     model.pan = vec2(0.0, 0.0);
                 }
             }
-            // Toggle full screen
             Key::F => {
                 if let Some(window) = app.window(model.window_id) {
                     let is_fs = window.is_fullscreen();
                     window.set_fullscreen(!is_fs);
                 }
             }
-            // Show at 100% scale
-            Key::Equals => {
+            Key::Equals | Key::NumpadAdd | Key::I => {
+                if let Mode::Single = model.mode {
+                    model.zoom = (model.zoom * 1.2).clamp(0.01, 10.0);
+                }
+            }
+            Key::Minus | Key::NumpadSubtract | Key::O => {
+                if let Mode::Single = model.mode {
+                    model.zoom = (model.zoom / 1.2).clamp(0.01, 10.0);
+                }
+            }
+            Key::R => {
                 if let Mode::Single = model.mode {
                     model.zoom = 1.0;
                     model.pan = vec2(0.0, 0.0);
@@ -1942,15 +1962,58 @@ fn key_pressed(app: &App, model: &mut Model, key: Key) {
             }
             _ => {}
         }
-    } else if app.keys.mods == ModifiersState::SHIFT && key == Key::G {
-        if let Mode::Thumbnails = model.mode {
-            let len = model.image_paths.len();
-            if len > 0 {
-                model.current = len - 1;
+    } else if ctrl_only {
+        match key {
+            Key::D => {
+                if let Mode::Thumbnails = model.mode {
+                    scroll_gallery_page(app, model, 1);
+                }
             }
+            Key::U => {
+                if let Mode::Thumbnails = model.mode {
+                    scroll_gallery_page(app, model, -1);
+                }
+            }
+            Key::H | Key::Left => {
+                if handle_arrow(app, model, ArrowDirection::Left, true) {
+                    return;
+                }
+            }
+            Key::L | Key::Right => {
+                if handle_arrow(app, model, ArrowDirection::Right, true) {
+                    return;
+                }
+            }
+            Key::K | Key::Up => {
+                if handle_arrow(app, model, ArrowDirection::Up, true) {
+                    return;
+                }
+            }
+            Key::J | Key::Down => {
+                if handle_arrow(app, model, ArrowDirection::Down, true) {
+                    return;
+                }
+            }
+            _ => {}
+        }
+
+    } else if shift_only {
+        match key {
+            Key::G => {
+                if let Mode::Thumbnails = model.mode {
+                    if len > 0 {
+                        model.current = len - 1;
+                    }
+                }
+            }
+            Key::Equals | Key::NumpadAdd | Key::I => {
+                if let Mode::Single = model.mode {
+                    model.zoom = (model.zoom * 1.2).clamp(0.01, 10.0);
+                }
+            }
+            _ => {}
         }
     }
-    // Custom key bindings execution
     let current_file = model.image_paths[model.current]
         .to_string_lossy()
         .to_string();
